@@ -1,7 +1,7 @@
 import json
 import datetime
 from . import api_blueprint as api
-from flask import current_app
+from flask import current_app, request
 from flask_login import login_required
 
 
@@ -15,98 +15,103 @@ class DateEncoder(json.JSONEncoder):
             return json.JSONEncoder.default(self, obj)
 
 
-@api.route('/get_clients')
-def get_clients():
-    return json.dumps(current_app.proxy_get_clients(), cls=DateEncoder)
+@api.route('/get-clients-info')
+def get_clients_info():
+    return json.dumps(current_app.proxy_clients_info(), cls=DateEncoder)
+
+
+@api.route('/get-server-info')
+def get_server_info():
+    return json.dumps(current_app.proxy_server_info(), cls=DateEncoder)
 
 
 @api.route('/start-server')
 @login_required
 def start_server():
-    current_app.proxy_start_server()
+    current_app.proxy_execute(current_app.proxy_api.STARTUP_SERVER)
     return str(True)
 
 
 @api.route('/stop-server')
 @login_required
 def stop_server():
-    current_app.proxy_stop_server()
+    current_app.proxy_execute(current_app.proxy_api.SHUTDOWN_SERVER)
     return str(True)
 
 
 @api.route('/restart-server')
 @login_required
 def restart_server():
-    if current_app.proxy_is_server_running():
-        current_app.proxy_stop_server()
-    current_app.proxy_start_server()
+    if current_app.proxy_is_running():
+        current_app.proxy_execute(current_app.proxy_api.SHUTDOWN_SERVER)
+    current_app.proxy_execute(current_app.proxy_api.STARTUP_SERVER)
     return str(True)
 
 
 @api.route('/pause-client/<string:client_id>')
 @login_required
 def pause_client(client_id):
-    current_app.proxy_pause_client(client_id)
+    current_app.proxy_execute(current_app.proxy_api.PAUSE_CLIENT, client_id)
     return str(True)
 
 
 @api.route('/resume-client/<string:client_id>')
 @login_required
 def resume_client(client_id):
-    current_app.proxy_resume_client(client_id)
+    current_app.proxy_execute(current_app.proxy_api.RESUME_CLIENT, client_id)
     return str(True)
 
 
 @api.route('/remove-client/<string:client_id>')
 @login_required
 def remove_client(client_id):
-    current_app.proxy_remove_client(client_id)
+    current_app.proxy_execute(current_app.proxy_api.REMOVE_CLIENT, client_id)
     return str(True)
 
 
-@api.route('/start-tcp-map/<int:server_port>')
+@api.route('/pause-tcp/<int:server_port>')
 @login_required
-def start_tcp_map(server_port):
-    current_app.proxy_start_tcp_map(server_port)
+def pause_tcp_map(server_port):
+    current_app.proxy_execute(current_app.proxy_api.PAUSE_TCP_MAP, server_port)
     return str(True)
 
 
-@api.route('/stop-tcp-map/<int:server_port>')
+@api.route('/resume-tcp/<int:server_port>')
 @login_required
-def stop_tcp_map(server_port):
-    current_app.proxy_stop_tcp_map(server_port)
+def resume_tcp_map(server_port):
+    current_app.proxy_execute(current_app.proxy_api.RESUME_TCP_MAP, server_port)
     return str(True)
 
 
-@api.route('/remove-tcp-map/<int:server_port>')
+@api.route('/remove-tcp/<int:server_port>')
 @login_required
 def remove_tcp_map(server_port):
-    current_app.proxy_remove_tcp_map(server_port)
+    current_app.proxy_execute(current_app.proxy_api.REMOVE_TCP_MAP, server_port)
     return str(True)
 
 
-@api.route('/start-udp-map/<int:server_port>')
+@api.route('/pause-udp/<int:server_port>')
 @login_required
-def start_udp_map(server_port):
-    current_app.proxy_start_udp_map(server_port)
+def pause_udp_map(server_port):
+    current_app.proxy_execute(current_app.proxy_api.PAUSE_UDP_MAP, server_port)
     return str(True)
 
 
-@api.route('/stop-udp-map/<int:server_port>')
+@api.route('/resume-udp/<int:server_port>')
 @login_required
-def stop_udp_map(server_port):
-    current_app.proxy_stop_udp_map(server_port)
+def resume_udp_map(server_port):
+    current_app.proxy_execute(current_app.proxy_api.RESUME_UDP_MAP, server_port)
     return str(True)
 
 
-@api.route('/remove-udp-map/<int:server_port>')
+@api.route('/remove-udp/<int:server_port>')
 @login_required
 def remove_udp_map(server_port):
-    current_app.proxy_remove_udp_map(server_port)
+    current_app.proxy_execute(current_app.proxy_api.REMOVE_UDP_MAP, server_port)
     return str(True)
 
 
-@api.route('/reset_statistic')
+@api.route('/reset-statistic')
 @login_required
 def reset_statistic():
     current_app.proxy_reset_statistic()

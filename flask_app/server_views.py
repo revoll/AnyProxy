@@ -11,25 +11,27 @@ server.add_app_template_global(stringify_bytes_val, 'stringify_bytes_val')
 @server.route('/')
 @login_required
 def index():
-    servers = current_app.proxy_get_server_info()
-    if len(servers) == 1:
-        server_info = {}
-        for s in servers:
-            server_info = servers[s]
-            break
-    else:
-        return "Error!"
+    server_info = current_app.proxy_server_info()
     return render_template('index.html', server_info=server_info)
 
 
 @server.route('/clients')
 @login_required
 def clients():
-    return render_template('clients.html', clients=current_app.proxy_get_clients(None))
+    clients_info = current_app.proxy_clients_info()
+    return render_template('clients.html', clients=clients_info)
 
 
 @server.route('/mappings')
 @login_required
 def mappings():
     cid = request.args.get('cid', None, type=str)
-    return render_template('mappings.html', clients=current_app.proxy_get_clients(cid))
+    clients_info = current_app.proxy_clients_info(cid)
+    pos_index = []
+    for cid in clients_info:
+        for port in clients_info[cid]['tcp_maps']:
+            pos_index.append((port, cid, 'tcp'))
+        for port in clients_info[cid]['udp_maps']:
+            pos_index.append((port, cid, 'udp'))
+    pos_index.sort(key=lambda m: m[0], reverse=False)
+    return render_template('mappings.html', clients=clients_info, index=pos_index)

@@ -5,7 +5,9 @@
 
 
 {% block main_content %}
+    <button id="reload-switch" class="btn btn-primary h2 pull-right" onclick="on_click_auto_reload()">关闭自动刷新</button>
     <h2 class="text-primary">共计{{ len(clients) }}个客户端：</h2>
+    <div class="clearfix"></div>
     <br>
     <div class="table-responsive">
         <table class="table table-striped table-hover">
@@ -15,6 +17,7 @@
                 <th>客户端ID</th>
                 <th class="text-center">名称</th>
                 <th class="text-center">公网地址</th>
+                <th class="text-right">协议流量</th>
                 <th class="text-center">TCP映射数</th>
                 <th class="text-right">TCP流量</th>
                 <th class="text-center">UDP映射数</th>
@@ -24,27 +27,26 @@
             </thead>
             <tbody>
             {% for c in clients %}
-              <tr id="client-{{ clients[c]['client_id'] }}">
+              <tr id="client-{{ clients[c]['client_id'] }}" class="{% if clients[c]['is_running'] %}{% elif clients[c]['is_alive'] %}warning{% else %}danger{% endif %}">
                 <td>{{ moment(clients[c]['start_time']).format('YYYY-MM-DD HH:mm:ss') }}</td>
-
-                <th scope="row">{{ clients[c]['client_id'] }}</th>
-
+                <th scope="row"{% if not clients[c]['is_alive'] %} class="text-danger"{% endif %}>{{ clients[c]['client_id'] }}</th>
                 <td class="text-center">{{ clients[c]['client_name'] }}</td>
-
-                <td class="text-center">{{ clients[c]['tcp_e_addr'] }}</td>
-
+                <td class="text-center">{{ clients[c]['tcp_e_addr'][0] }}</td>
+                <td class="text-right">{{ stringify_bytes_val(clients[c]['total_statistic'][0] + clients[c]['total_statistic'][1] - clients[c]['tcp_statistic'][0] - clients[c]['tcp_statistic'][1] - clients[c]['udp_statistic'][0] - clients[c]['udp_statistic'][1]) }}</td>
                 <td class="text-center">
                   <a href="{{ url_for('server.mappings', cid=c) }}"><b>{{ len(clients[c]['tcp_maps']) }}</b></a>
                 </td>
-                <td class="text-right">{{ stringify_bytes_val(clients[c]['tcp_statistic']) }}</td>
-
+                <td class="text-right">{{ stringify_bytes_val(clients[c]['tcp_statistic'][0] + clients[c]['tcp_statistic'][1]) }}</td>
                 <td class="text-center">
                   <a href="{{ url_for('server.mappings', cid=c) }}"><b>{{ len(clients[c]['udp_maps']) }}</b></a>
                 </td>
-                <td class="text-right">{{ stringify_bytes_val(clients[c]['udp_statistic']) }}</td>
-
+                <td class="text-right">{{ stringify_bytes_val(clients[c]['udp_statistic'][0] + clients[c]['udp_statistic'][1]) }}</td>
                 <td class="op-widget-box text-center">
-                  <span class="glyphicon glyphicon-{{ 'pause' if clients[c]['is_running'] else 'play' }} text-primary" onclick="{{ 'stop_client' if clients[c]['is_running'] else 'resume_client' }}('{{ clients[c]['client_id'] }}')"></span>
+                  {% if clients[c]['is_alive'] %}
+                  <span class="glyphicon glyphicon-{{ 'pause' if clients[c]['is_running'] else 'play' }} text-primary" onclick="{{ 'pause_client' if clients[c]['is_running'] else 'resume_client' }}('{{ clients[c]['client_id'] }}')"></span>
+                  {% else %}
+                  <span class="glyphicon glyphicon-alert text-warning"></span>
+                  {% endif %}
                   <span class="glyphicon glyphicon-remove text-danger" onclick="remove_client('{{ clients[c]['client_id'] }}')"></span>
                 </td>
               </tr>
@@ -56,34 +58,26 @@
 
 
 {% block scripts %}
-
     {{ super() }}
-
     <script type="text/javascript">
-        function stop_client(cid) {
-            $.get("{{ url_for('api.pause_client', client_id=0) }}".replace(/0/, cid), function(){
-                setTimeout("window.location.reload()", 100);
-            });
+        var auto_reload = true;
+
+        function on_click_auto_reload() {
+            if (auto_reload) {
+                auto_reload = false;
+                $('#reload-switch').text('打开自动刷新');
+            } else {
+                auto_reload = true;
+                $('#reload-switch').text('关闭自动刷新');
+            }
         }
 
-        function resume_client(cid) {
-            $.get("{{ url_for('api.resume_client', client_id=0) }}".replace(/0/, cid), function(){
-                setTimeout("window.location.reload()", 100);
-            });
-        }
-
-        function remove_client(cid) {
-            notification_init(
-                '提示', '确定删除客户端（' + cid + '）？',
-                '<button class="btn btn-default" data-dismiss="modal">取消</button><button class="btn btn-danger" onclick="confirm_remove_client(\'' + cid + '\')">删除</button>');
-            notification_show();
-        }
-
-        function confirm_remove_client(cid) {
-            $.get("{{ url_for('api.remove_client', client_id=0) }}".replace(/0/, cid), function(){
-                setTimeout("window.location.reload()", 100);
-            });
+        window.onload = function() {
+            setInterval(function(){
+                if (auto_reload) {
+                    window.location.reload();
+                }
+            }, 5000);
         }
     </script>
-
 {% endblock scripts %}

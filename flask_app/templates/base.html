@@ -81,6 +81,138 @@
     <script src="{{ url_for('static', filename='js/moment-with-locales.min.js') }}"></script>
     <script src="{{ url_for('static', filename='js/common.js') }}"></script>
     <script type="text/javascript">
+
+        function pause_tcp_map(server_port) {
+            $.get("{{ url_for('api.pause_tcp_map', server_port=0) }}".replace(/0/, server_port), function(){
+                setTimeout("window.location.reload()", 100);
+            });
+        }
+
+        function resume_tcp_map(server_port) {
+            $.get("{{ url_for('api.resume_tcp_map', server_port=0) }}".replace(/0/, server_port), function(){
+                setTimeout("window.location.reload()", 100);
+            });
+        }
+
+        function remove_tcp_map(server_port) {
+            notification_init(
+                '提示', '确定删除TCP代理端口（' + server_port + '）？',
+                '<button class="btn btn-default" data-dismiss="modal">取消</button><button class="btn btn-danger" onclick="confirm_remove_tcp_map(\'' + server_port + '\')">删除</button>');
+            notification_show();
+        }
+
+        function confirm_remove_tcp_map(server_port) {
+            $.get("{{ url_for('api.remove_tcp_map', server_port=0) }}".replace(/0/, server_port), function(){
+                setTimeout("window.location.reload()", 100);
+            });
+        }
+
+        function pause_udp_map(server_port) {
+            $.get("{{ url_for('api.pause_udp_map', server_port=0) }}".replace(/0/, server_port), function(){
+                setTimeout("window.location.reload()", 100);
+            });
+        }
+
+        function resume_udp_map(server_port) {
+            $.get("{{ url_for('api.resume_udp_map', server_port=0) }}".replace(/0/, server_port), function(){
+                setTimeout("window.location.reload()", 100);
+            });
+        }
+
+        function remove_udp_map(server_port) {
+            notification_init(
+                '提示', '确定删除TCP代理端口（' + server_port + '）？',
+                '<button class="btn btn-default" data-dismiss="modal">取消</button><button class="btn btn-danger" onclick="confirm_remove_udp_map(\'' + server_port + '\')">删除</button>');
+            notification_show();
+        }
+
+        function confirm_remove_udp_map(server_port) {
+            $.get("{{ url_for('api.remove_udp_map', server_port=0) }}".replace(/0/, server_port), function(){
+                setTimeout("window.location.reload()", 100);
+            });
+        }
+
+
+        function pause_client(cid) {
+            $.get("{{ url_for('api.pause_client', client_id=0) }}".replace(/0/, cid), function(){
+                setTimeout("window.location.reload()", 100);
+            });
+        }
+
+        function resume_client(cid) {
+            $.get("{{ url_for('api.resume_client', client_id=0) }}".replace(/0/, cid), function(){
+                setTimeout("window.location.reload()", 100);
+            });
+        }
+
+        function remove_client(cid) {
+            notification_init(
+                '提示', '确定删除客户端（' + cid + '）？',
+                '<button class="btn btn-default" data-dismiss="modal">取消</button><button class="btn btn-danger" onclick="confirm_remove_client(\'' + cid + '\')">删除</button>');
+            notification_show();
+        }
+
+        function confirm_remove_client(cid) {
+            $.get("{{ url_for('api.remove_client', client_id=0) }}".replace(/0/, cid), function(){
+                setTimeout("window.location.reload()", 100);
+            });
+        }
+
+
+        function start_server() {
+            notification_init(
+                '提示', '确定开启端口代理服务？',
+                '<button class="btn btn-default" data-dismiss="modal">取消</button><button class="btn btn-danger" onclick="confirm_start_server()">启动</button>');
+            notification_show();
+        }
+
+        function confirm_start_server() {
+            $.get("{{ url_for('api.start_server') }}", function(){
+                window.location.reload();
+            });
+        }
+
+        function stop_server() {
+            notification_init(
+                '提示', '确定关闭端口代理服务？',
+                '<button class="btn btn-default" data-dismiss="modal">取消</button><button class="btn btn-danger" onclick="confirm_stop_server()">关闭</button>');
+            notification_show();
+        }
+
+        function confirm_stop_server() {
+            $.get("{{ url_for('api.stop_server') }}", function(){
+                window.location.reload();
+            });
+        }
+
+        function restart_server() {
+            notification_init(
+                '提示', '确定重启端口代理服务？',
+                '<button class="btn btn-default" data-dismiss="modal">取消</button><button class="btn btn-danger" onclick="confirm_restart_server()">重启</button>');
+            notification_show();
+        }
+
+        function confirm_restart_server() {
+            $.get("{{ url_for('api.restart_server') }}", function(){
+                window.location.reload();
+            });
+        }
+
+
+        function reset_statistic() {
+            notification_init(
+                '提示', '确定重置所有流量统计数据？',
+                '<button class="btn btn-default" data-dismiss="modal">取消</button><button class="btn btn-danger" onclick="confirm_reset_statistic()">重置</button>');
+            notification_show();
+        }
+
+        function confirm_reset_statistic() {
+            $.get("{{ url_for('api.reset_statistic') }}", function(){
+                window.location.reload();
+            });
+        }
+
+
         $(document).ready(function() {
             //
 	        // flask moment timestamp
@@ -91,6 +223,7 @@
                 $(this).removeClass('flask-moment');
                 $(this).css('display', 'inline');
             });
+
             //
             // 以模态框的形式显示flash消息
             //

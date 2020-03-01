@@ -7,94 +7,191 @@
 {% block main_content %}
     <div class="docs-page">
 
-        <h1 class="text-primary">端口代理服务管理中心</h1>
-        <br/>
+        <h1 class="text-primary">{{ server_info['server_name'] }}<small>【SID:{{ server_info['server_id'] }}】</small></h1>
+        <hr>
 
-        {% if server_info["is_running"] %}
-            <h3><span>服务正在运行中...</span><small>（启动时间：{{ moment(server_info["start_time"]).format('YYYY-MM-DD HH:mm:ss') }}）</small>
-            <button class="btn btn-danger" onclick="stop_server()">关闭端口代理</button>
-            <button class="btn btn-success" onclick="restart_server()">重启端口代理</button>
-            </h3>
-        {% else %}
-            <h3><span>服务未启动。</span><small>（最后时间：{{ moment(server_info["start_time"]).format('YYYY-MM-DD HH:mm:ss') }}）</small>
-            <button class="btn btn-primary" onclick="start_server()">开启端口代理</button>
-            </h3>
-        {% endif %}
+        <div class="pull-left">
+            <dl class="dl-horizontal">
+                <dt>Server Port</dt><dd>tcp({{ server_info['server_port'] }}), udp({{ server_info['server_port'] }})</dd>
+                <dt>Status</dt>{% if server_info['is_running'] %}<dd class="text-success" style="font-weight:bold;">running</dd>{% else %}<dd class="text-danger" style="font-weight:bold;">stopped</dd>{% endif %}
+                <dt>Num of Clients</dt><dd id="num-clients">{{ server_info['alive_clients'] }} alive of {{ server_info['total_clients'] }} client(s)</dd>
+                <dt>Up Stream</dt><dd id="upstream">{{ stringify_bytes_val(server_info['total_statistic'][0]) }}</dd>
+                <dt>Down Stream</dt><dd id="downstream">{{ stringify_bytes_val(server_info['total_statistic'][1]) }}</dd>
+                <dt>Total Stream</dt><dd id="total-stream">{{ stringify_bytes_val(server_info['total_statistic'][0] + server_info['total_statistic'][1]) }}</dd>
+                <dt>Server Created Time</dt><dd>{{ moment(server_info["start_time"]).format('YYYY-MM-DD HH:mm:ss') }}</dd>
+            </dl>
+        </div>
+        <div class="pull-right">
+            {% if server_info["is_running"] %}
+            <p><button class="btn btn-danger" onclick="stop_server()">关闭端口代理</button></p>
+            <p><button class="btn btn-warning" onclick="restart_server()">重启端口代理</button></p>
+            <p><button class="btn btn-primary" onclick="reset_statistic()">重置流量统计</button></p>
+            {% else %}
+            <p class=""><button class="btn btn-success" onclick="start_server()">开启端口代理</button></p>
+            {% endif %}
+        </div>
+        <div class="clearfix"></div>
+
+        <br>
+        <div id="echarts-speed" style="height: 320px; min-width: 720px;"></div>
         <hr/>
-
-        <p>ServerID: {{ server_info['server_id'] }}</p>
-        <p>ServerName: {{ server_info['server_name'] }}</p>
-        <p>ServerAddr: {{ server_info['server_host'] }}:{{ server_info['server_port'] }}</p>
-        <p>Clients: {{ server_info['clients_cnt'] }}</p>
-        <p>TCP流量: {{ server_info['tcp_statistic'] }}</p>
-        <p>UDP流量: {{ server_info['udp_statistic'] }}</p>
-        <p>总流量: {{ server_info['total_statistic'] }}</p>
-
-        <hr/>
-        <button class="btn btn-primary" onclick="reset_statistic()">重置流量统计</button>
-
     </div>
 {% endblock main_content %}
 
 
 {% block scripts %}
-
     {{ super() }}
-    <!-- <script type="text/javascript" src="http://echarts.baidu.com/gallery/vendors/echarts/echarts.min.js"></script> -->
-
+    <script type="text/javascript" src="{{ url_for('static', filename='js/echarts.min.js') }}"></script>
     <script type="text/javascript">
-
-        function start_server() {
-            notification_init(
-                '提示', '确定开启端口代理服务？',
-                '<button class="btn btn-default" data-dismiss="modal">取消</button><button class="btn btn-danger" onclick="confirm_start_server()">启动</button>');
-            notification_show();
+    function stringify_bytes_val(value) {
+        var unit = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+        var level = 0;
+        var positive = true;
+        if (value < 0) {
+            positive = false;
+            value = -value;
         }
-
-        function confirm_start_server() {
-            $.get("{{ url_for('api.start_server') }}", function(){
-                window.location.reload();
-            });
+        while (level < 5) {
+            if (value < 1000) {
+                break;
+            } else {
+                level += 1;
+                value /= 1000;
+            }
         }
+        return (positive ? value : -value).toString().substring(0, 5) + ' ' + unit[level];
+    }
 
-        function stop_server() {
-            notification_init(
-                '提示', '确定关闭端口代理服务？',
-                '<button class="btn btn-default" data-dismiss="modal">取消</button><button class="btn btn-danger" onclick="confirm_stop_server()">关闭</button>');
-            notification_show();
-        }
+    var x_axis_samples = 60;
+    var x_axis_list = Array.from({length: x_axis_samples + 1}, (item, index) => index.toString() + 's');
+    var total_list = [0];  // Array.from({length: x_axis_samples}, (item, index) => 0).concat(500000000);
+    var upstream_list = [];
+    var downstream_list = [];
+    var g_statistic = {
+        "is_running": {% if server_info["is_running"] %}true{% else %}false{%endif%},
+        "alive_clients": {{ server_info["alive_clients"] }},
+        "total_clients": {{ server_info["total_clients"] }},
+        "tcp_statistic": Array{{ server_info["tcp_statistic"] }},
+        "udp_statistic": Array{{ server_info["udp_statistic"] }},
+        "total_statistic": Array{{ server_info["total_statistic"] }},
+    };
 
-        function confirm_stop_server() {
-            $.get("{{ url_for('api.stop_server') }}", function(){
-                window.location.reload();
-            });
-        }
+    var speed_chart = echarts.init(document.getElementById("echarts-speed"));
+    var speed_chart_option = {
+        backgroundColor: '#f0f0f0',
+        textStyle: { color: 'black' },
+        title: [
+            { id: 'total', text: '总流量: ', top: 16, left: 75, textStyle: { color: '#3c763d' } },
+            { id: 'upstream', text: '上行: ', top: 16, left: '50%', textStyle: { color: '#a94442' } },
+            { id: 'downstream', text: '下行: ', top: 16, left: '75%', textStyle: { color: '#337ab7' } },
+        ],
+        grid: { top: 60, left: 80, right: 1, bottom: 40 },
+        xAxis: {
+            type: 'category',
+            boundaryGap: false,
+            axisLabel: { margin: 12, fontSize: 12, fontWeight: 'bold', align: 'center' },
+            // minorTick: { show: true },
+            // splitLine: { lineStyle: { color: '#999' } },
+            // minorSplitLine: { show: true, lineStyle: { color: '#ddd' } },
+            data: x_axis_list,
+        },
+        yAxis: {
+            axisLabel: {
+                margin: 12, fontSize: 14, fontWeight: 'bold', verticalAlign: 'top',
+                formatter: function (value, index) { return (index === 0) ? '' : stringify_bytes_val(value) + '/s'; },
+            },
+            position: 'left',
+            // minorTick: { show: true },
+            // splitLine: { lineStyle: { color: '#999' } },
+            // minorSplitLine: { show: true, lineStyle: { color: '#ddd' } },
+        },
+        /* series: [{
+            type: 'line',
+            name: 'Total',
+            smooth: true,
+            areaStyle: {},
+            symbol: 'none',
+            symbolSize: 0,
+            lineStyle: { color: '#3c763d', width: 1 },
+            itemStyle: { color: '#5cb85c' },
+            data: total_list,
+        }, {
+            type: 'line',
+            name: 'UpStream',
+            smooth: true,
+            symbol: 'none',
+            symbolSize: 0,
+            lineStyle: { color: '#a94442', width: 1 },
+            data: upstream_list,
+        }, {
+            type: 'line',
+            name: 'DownStream',
+            smooth: true,
+            symbol: 'none',
+            symbolSize: 0,
+            lineStyle: { color: '#337ab7', width: 1 },
+            data: downstream_list,
+        }], */
+        series: {
+            type: 'line',
+            name: 'Total',
+            smooth: true,
+            areaStyle: {},
+            symbol: 'none',
+            symbolSize: 0,
+            lineStyle: { color: 'green', width: 1 },
+            itemStyle: { color: 'green' },
+            data: total_list,
+        },
+        tooltip: {
+            trigger: 'axis',
+            axisPointer: { type: 'cross' },
+            formatter: '{b0}: {c0} B/s',
+            textStyle: { fontSize: 16, fontWeight: 'bold' },
+        },
+        animation: false,
+    };
+    speed_chart.setOption(speed_chart_option, true);
 
-        function restart_server() {
-            notification_init(
-                '提示', '确定重启端口代理服务？',
-                '<button class="btn btn-default" data-dismiss="modal">取消</button><button class="btn btn-danger" onclick="confirm_restart_server()">重启</button>');
-            notification_show();
-        }
+    function refresh_statistic(){
+        $.get("{{ url_for('api.get_server_info') }}", function(result){
+            var current = $.parseJSON(result);
+            var previous = g_statistic;
+            g_statistic = current;
 
-        function confirm_restart_server() {
-            $.get("{{ url_for('api.restart_server') }}", function(){
-                window.location.reload();
-            });
-        }
+            var upstream = current.total_statistic[0] - previous.total_statistic[0];
+            var downstream = current.total_statistic[1] - previous.total_statistic[1];
+            var total = upstream + downstream;
+            var list_len = x_axis_samples + 3;
 
-        function reset_statistic() {
-            notification_init(
-                '提示', '确定重置所有流量统计数据？',
-                '<button class="btn btn-default" data-dismiss="modal">取消</button><button class="btn btn-danger" onclick="confirm_reset_statistic()">重置</button>');
-            notification_show();
-        }
+            $('#num-clients').text(current.alive_clients + ' alive of ' + current.total_clients + ' client(s)');
+            $('#upstream').text(stringify_bytes_val(current.total_statistic[0]));
+            $('#downstream').text(stringify_bytes_val(current.total_statistic[1]));
+            $('#total-stream').text(stringify_bytes_val(current.total_statistic[0] + current.total_statistic[1]));
 
-        function confirm_reset_statistic() {
-            $.get("{{ url_for('api.reset_statistic') }}", function(){
-                window.location.reload();
-            });
-        }
+            if (total_list.length > list_len) {
+                total_list.pop();
+            }
+            // if (upstream_list.length > list_len) {
+            //    upstream_list.pop();
+            // }
+            // if (downstream_list.length > list_len) {
+            //    downstream_list.pop();
+            // }
+            total_list.unshift(total);
+            // upstream_list.unshift(upstream);
+            // downstream_list.unshift(downstream);
+
+            speed_chart_option.title[0].text = '总流量: ' + stringify_bytes_val(total) + '/s';
+            speed_chart_option.title[1].text = '上行: ' + stringify_bytes_val(upstream) + '/s';
+            speed_chart_option.title[2].text = '下行: ' + stringify_bytes_val(downstream) + '/s';
+
+            speed_chart.setOption(speed_chart_option, true);
+        });
+    }
+
+    window.onload = function() {
+        setInterval(refresh_statistic, 1000);
+    }
     </script>
-
 {% endblock scripts %}

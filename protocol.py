@@ -1,4 +1,5 @@
 import asyncio
+import struct
 from datetime import datetime
 from uuid import uuid4
 from xml.etree import ElementTree
@@ -6,12 +7,7 @@ from loguru import logger as log
 
 
 class ProtocolError(Exception):
-
-    def __init__(self, msg='', cmd=None, data=None):
-        err = '%s (command: %s, data: %s)' % (msg, cmd, data) if cmd is not None else msg
-        Exception.__init__(self, err)
-        self.cmd = cmd
-        self.data = data
+    pass
 
 
 class Protocol:
@@ -37,45 +33,43 @@ class Protocol:
         |
         |-- ADD_TCP_MAP: Request('client_port:server_port') >>> Response('Success'/'Error'/'Invalid')
         |
-        |-- START_TCP_MAP: Request('server_port') >>> Response('Success'/'Error'/'Invalid')
+        |-- PAUSE_TCP_MAP: Request('server_port') >>> Response('Success'/'Error'/'Invalid')
         |
-        |-- STOP_TCP_MAP: Request('server_port') >>> Response('Success'/'Error'/'Invalid')
+        |-- RESUME_TCP_MAP: Request('server_port') >>> Response('Success'/'Error'/'Invalid')
         |
         |-- REMOVE_TCP_MAP: Request('server_port') >>> Response('Success'/'Error'/'Invalid')
         |
         |-- ADD_UDP_MAP: Request('client_port:server_port') >>> Response('Success'/'Error'/'Invalid')
         |
-        |-- START_UDP_MAP: Request('server_port') >>> Response('Success'/'Error'/'Invalid')
+        |-- PAUSE_UDP_MAP: Request('server_port') >>> Response('Success'/'Error'/'Invalid')
         |
-        |-- STOP_UDP_MAP: Request('server_port') >>> Response('Success'/'Error'/'Invalid')
+        |-- RESUME_UDP_MAP: Request('server_port') >>> Response('Success'/'Error'/'Invalid')
         |
         |-- REMOVE_UDP_MAP: Request('server_port') >>> Response('Success'/'Error'/'Invalid')
         |
-        |-- PAUSE_PROXY: Request('') >>> Response('Success'/'Error'/'Invalid')
+        |-- PAUSE_PROXY: Request() >>> Response('Success'/'Error'/'Invalid')
         |
-        |-- RESUME_PROXY: Request('') >>> Response('Success'/'Error'/'Invalid')
+        |-- RESUME_PROXY: Request() >>> Response('Success'/'Error'/'Invalid')
         |
-        `-- DISCONNECT: Request('') >>> Response('Success'/'Error'/'Invalid')
+        `-- DISCONNECT: Request() >>> Response('Success'/'Error'/'Invalid')
     """
     DEFAULT_SID_LENGTH = 8                      # 服务器SID长度
     CID_LENGTH = 8                              # 客户端CID长度
-    SOCKET_BUFFER_SIZE = 1500                   # 套接字socket缓存大小
-    TASK_SCHEDULE_PERIOD = 0.2                  # 任务挂起等待的时间粒度
-    UDP_REQUEST_DEADLINE = 1200                 # UDP请求的记录保留时效
-    CLIENT_TCP_PING_PERIOD = 10                 # 客户端TCP保活时间
-    CLIENT_UDP_PING_PERIOD = 10                 # 客户端UDP保活时间
+    PARAM_SEPARATOR = '**'                      # 数据项之间的分隔符
+    SOCKET_BUFFER_SIZE = 65536  # 1400                   # TODO:套接字socket缓存大小。目前的UDP封包设计可能导致性能下降。
+    TASK_SCHEDULE_PERIOD = 0.001                # 任务挂起等待的时间粒度
+    UDP_REQUEST_DURATION = 9000                 # UDP请求的记录保留时效(2.5h)
+    CLIENT_TCP_PING_PERIOD = 30                 # 客户端TCP保活探测时间
+    CLIENT_UDP_PING_PERIOD = 5                  # 客户端UDP保活时间
+    UDP_UNREACHABLE_WARNING_PERIOD = 16         # 打印无法接收UDP PING包日志的超时时间
     CONNECTION_TIMEOUT = 30                     # TCP连接超时时间
-    MAX_RETRY_PERIOD = 60                       # 超时重连的情况下，最大重连间隔时间
-    SEPARATOR = '**'                            # 数据项之间的分隔符
+    MAX_RETRY_PERIOD = 60                       # 客户端在断开重连的情况下，最大重连时间间隔
 
-    __REQUEST_QUEUE_SIZE = 200                  #
-
-    class Result:
-        """Standard function call result."""
-        ERROR = 'Error'
-        SUCCESS = 'Success'
-        INVALID = 'Invalid'
-        UNKNOWN = 'Unknown'
+    class ConnectionType:
+        """Connection type."""
+        MANAGER = 'Manager'
+        PROXY_CLIENT = 'ProxyClient'
+        PROXY_TCP_DATA = 'ProxyTcpData'
 
     class Command:
         """Common command used by both server and client."""
@@ -87,168 +81,216 @@ class Protocol:
 
     class ClientCommand:
         """Used by client to communicate with server."""
-        CHECK_TCP_PORT = 'CheckTcpPort'
-        CHECK_UDP_PORT = 'CheckUdpPort'
+        CHECK_TCP_PORT = 'CheckTcpPort'         # 检查TCP服务是否开启
+        CHECK_UDP_PORT = 'CheckUdpPort'         # 检查UDP端口是否可用
         ADD_TCP_MAP = 'AddTcpMap'
-        START_TCP_MAP = 'StartTcpMap'
-        STOP_TCP_MAP = 'StopTcpMap'
+        PAUSE_TCP_MAP = 'PauseTcpMap'
+        RESUME_TCP_MAP = 'ResumeTcpMap'
         REMOVE_TCP_MAP = 'RemoveTcpMap'
         ADD_UDP_MAP = 'AddUdpMap'
-        START_UDP_MAP = 'StartUdpMap'
-        STOP_UDP_MAP = 'StopUdpMap'
+        PAUSE_UDP_MAP = 'PauseUdpMap'
+        RESUME_UDP_MAP = 'ResumeUdpMap'
         REMOVE_UDP_MAP = 'RemoveUdpMap'
         PAUSE_PROXY = 'PauseProxy'
         RESUME_PROXY = 'ResumeProxy'
         DISCONNECT = 'Disconnect'
 
-    class ConnectionType:
-        """Connection type."""
-        MANAGER = 'Manager'
-        PROXY_CLIENT = 'ProxyClient'
-        PROXY_TCP_DATA = 'ProxyTcpData'
-
-    class __XmlTag:
-        """Standard xml tags."""
-        REQUEST = 'request'
-        RESPONSE = 'response'
-        UUID = 'uuid'
-        TYPE = 'type'
-        NAME = 'name'
-
-    @staticmethod
-    def make_req(uuid, key, val):
-        req_node = ElementTree.Element(Protocol.__XmlTag.REQUEST, attrib={Protocol.__XmlTag.UUID: uuid})
-        cmd_node = ElementTree.SubElement(req_node, str(key))
-        cmd_node.text = str(val) if val else ''
-        return ElementTree.tostring(req_node, encoding='unicode')
-
-    @staticmethod
-    def make_resp(uuid, key, val):
-        resp_node = ElementTree.Element(Protocol.__XmlTag.RESPONSE, attrib={Protocol.__XmlTag.UUID: uuid})
-        cmd_node = ElementTree.SubElement(resp_node, str(key))
-        cmd_node.text = str(val) if val else ''
-        return ElementTree.tostring(resp_node, encoding='unicode')
-
-    @staticmethod
-    def parse_msg(message):
-        root = ElementTree.fromstring(message)
-        return root.tag, root.attrib[Protocol.__XmlTag.UUID], root[0].tag, root[0].text
+    class Result:
+        """Standard function call result."""
+        ERROR = 'Error'
+        SUCCESS = 'Success'
+        INVALID = 'Invalid'
+        UNKNOWN = 'Unknown'
 
     def __init__(self, tcp_stream=None):
         self.__reader = tcp_stream[0]
         self.__writer = tcp_stream[1]
 
-        # request queue format: [(cid, cmd, data), ...]
-        self.__request_queue = asyncio.Queue(Protocol.__REQUEST_QUEUE_SIZE)
-        # response pool format: {cid: (cmd, data), ...}
+        # request queue format: [(uuid, cmd, data), ...]
+        self.__request_queue = asyncio.Queue()
+        # response pool format: {uuid: (cmd, data), ...}
         self.__response_pool = {}
 
         self.__status = False
         self.__task_recv_msg = asyncio.create_task(self.__recv_msg_task())
 
+        self.tcp_statistic = [0, 0]             # TCP上下行流量
+        self.udp_statistic = [0, 0]             # UDP上下行流量
+
+    @staticmethod
+    def make_req(uuid, key, val):
+        return f'<request uuid="{uuid}" type="{key}">{val if val else ""}</request>'
+
+    @staticmethod
+    def make_resp(uuid, key, val):
+        return f'<response uuid="{uuid}" type="{key}">{val if val else ""}</response>'
+
+    @staticmethod
+    def parse_msg(msg):
+        root = ElementTree.fromstring(msg)
+        return root.tag, root.attrib['uuid'], root.attrib['type'], root.text
+
     async def __recv_msg_task(self):
+        self.__status = True
         try:
-            self.__status = True
-
             while True:
-                message = await self.__reader.readline()  # This will block until tcp data arrived.
+                msg = await self.__reader.readline()
 
-                if message:
-                    message = message.decode().strip()
+                if msg:
+                    self.tcp_statistic[1] += len(msg)
                 else:
                     remote = self.__writer.get_extra_info('peername')
-                    raise ProtocolError(f'Protocol connection with client {remote} is closed or broken.')
+                    raise ConnectionError(f'Protocol connection with {remote} is closed or broken.')
 
                 try:
-                    req_or_resp, cid, key, val = Protocol.parse_msg(message)
-                except (KeyError, Exception):
+                    msg = msg.decode().strip()
+                    log.debug(msg)
+                    msg_type, uuid, key, val = Protocol.parse_msg(msg)
+                except Exception as e:
+                    log.warning(f'protocol error while parsing {msg}: {e}')
                     continue
 
-                if req_or_resp == Protocol.__XmlTag.REQUEST:
-                    await self.__request_queue.put((cid, key, val))
-                elif req_or_resp == Protocol.__XmlTag.RESPONSE:
-                    self.__response_pool[cid] = (key, val)
+                if msg_type == 'request':
+                    await self.__request_queue.put((uuid, key, val))
+                elif msg_type == 'response':
+                    self.__response_pool[uuid] = (key, val)
                 else:
-                    log.warning(f'Received unrecognised message: {message}')
-        finally:
+                    log.warning(f'can not recognise message type of: {msg}')
+        except Exception as e:
+            log.error(e)
             self.__writer.close()
             self.__status = False
+
+    def close(self):
+        self.__task_recv_msg.cancel()
+        self.__writer.close()
+        self.__status = False
+
+    async def wait_closed(self):
+        # TODO: WARNING: 此函数直接写成 `await self.__task_recv_msg` 会导致调用异常，目前不知道原因。
+        # try:
+        #     await self.__task_recv_msg
+        # except asyncio.CancelledError:
+        #     self.__writer.close()
+        #     self.__status = False
+        while self.__status:
+            await asyncio.sleep(Protocol.TASK_SCHEDULE_PERIOD)
 
     def is_healthy(self):
         return self.__status
 
-    def close(self):
-        self.__task_recv_msg.cancel()
-
-    async def wait_closed(self):
+    async def send_request(self, uuid, cmd, data=None):
+        """
+        send request
+        :param uuid:
+        :param cmd:
+        :param data:
+        :return:
+        @throws: ConnectionError(IOError)
+        """
         try:
-            await self.__task_recv_msg
-        except ProtocolError as e:
-            log.error(e)
-        except asyncio.CancelledError:
-            self.__writer.close()
-            self.__status = False
+            req = Protocol.make_req(uuid, cmd, data)
+            b_req = (req + '\n').encode()
+            self.__writer.write(b_req)
+            await self.__writer.drain()
+            self.tcp_statistic[0] += len(b_req)
+            log.debug(req)
+        except Exception:
+            self.close()
+            raise
+
+    async def send_response(self, uuid, cmd, data=None):
+        """
+        send response
+        :param uuid:
+        :param cmd:
+        :param data:
+        :return:
+        @throws: ConnectionError(IOError)
+        """
+        try:
+            resp = Protocol.make_resp(uuid, cmd, data)
+            b_resp = (resp + '\n').encode()
+            self.__writer.write(b_resp)
+            await self.__writer.drain()
+            self.tcp_statistic[0] += len(b_resp)
+            # self.__request_queue.task_done()
+            log.debug(resp)
+        except Exception:
+            self.close()
+            raise
 
     async def get_request(self, timeout=None):
         """
-        从指令池中取出一个指令（用于对指令进行处理和响应）。
+        get request
         :param timeout:
-        :return: 取出的指令，或者抛出'asyncio.TimeoutError'异常
+        :return:
+        @throws: BlockingIOError, asyncio.TimeoutError
         """
-        async def wait_request(request_queue):
-            return await request_queue.get()
-
-        task = asyncio.create_task(wait_request(self.__request_queue))
-        await asyncio.wait_for(task, timeout=timeout)
-        req = task.result()
-        log.debug(Protocol.make_req(req[0], req[1], req[2]))
-        return req
-
-    async def send_response(self, cid, cmd, data):
-        """
-        向指令请求方发送响应消息。
-        :param cid:
-        :param cmd:
-        :param data:
-        :return: 可能会抛出'ConnectionError'类的异常
-        """
-        log.debug(Protocol.make_resp(cid, cmd, data))
-        try:
-            self.__writer.write((Protocol.make_resp(cid, cmd, data) + '\n').encode())
-            await self.__writer.drain()
-        finally:
+        if not self.__request_queue.empty():
+            req = self.__request_queue.get_nowait()
             self.__request_queue.task_done()
-        return True
+            return req
+        elif timeout == 0:
+            raise BlockingIOError(f'Protocol failed to get request as no request arrived.')
+        wait_time = 0
+        while True:
+            await asyncio.sleep(Protocol.TASK_SCHEDULE_PERIOD)
+            wait_time += Protocol.TASK_SCHEDULE_PERIOD
+            if not self.__request_queue.empty():
+                req = self.__request_queue.get_nowait()
+                self.__request_queue.task_done()
+                return req
+            if timeout is None or timeout < 0:
+                continue
+            if wait_time >= timeout:
+                raise asyncio.TimeoutError(f'Protocol get request timeout after waiting {timeout}s.')
 
-    async def request(self, cmd, data, timeout=None):
+    async def get_response(self, uuid, timeout=None):
         """
-        发送指令，并获取得到的响应结果。
+        get response
+        :param uuid:
+        :param timeout:
+        :return:
+        @throws: BlockingIOError, asyncio.TimeoutError
+        """
+        if uuid in self.__response_pool:
+            resp = self.__response_pool[uuid]
+            del self.__response_pool[uuid]
+            return resp
+        elif timeout == 0:
+            raise BlockingIOError(f'Protocol failed to get response with uuid={uuid}.')
+        wait_time = 0
+        while True:
+            await asyncio.sleep(Protocol.TASK_SCHEDULE_PERIOD)
+            wait_time += Protocol.TASK_SCHEDULE_PERIOD
+            if uuid in self.__response_pool:
+                resp = self.__response_pool[uuid]
+                del self.__response_pool[uuid]
+                return resp
+            if timeout is None or timeout < 0:
+                continue
+            if wait_time >= timeout:
+                raise asyncio.TimeoutError(f'Protocol get response timeout after waiting {timeout}s.')
+
+    async def request(self, cmd, data=None, timeout=None):
+        """
+        make request
         :param cmd:
         :param data:
         :param timeout:
-        :return: 返回的结果，或者抛出'asyncio.TimeoutError'/'ProtocolError'异常
+        :return:
+        @throws: IOError, asyncio.TimeoutError, ProtocolError
         """
-        async def wait_response(response_pool, cid):
-            while True:
-                if cid in response_pool.keys():
-                    break
-                await asyncio.sleep(0.1)
-
         req_uuid = uuid4().hex
-        req = Protocol.make_req(req_uuid, cmd, data)
-        self.__writer.write((req + '\n').encode())
-        await self.__writer.drain()
-        log.debug(req)
-
-        await asyncio.wait_for(wait_response(self.__response_pool, req_uuid), timeout)
-        cmd2, data2 = self.__response_pool[req_uuid]
-        del self.__response_pool[req_uuid]
-        log.debug(Protocol.make_resp(req_uuid, cmd2, data2))
-
+        await self.send_request(req_uuid, cmd, data)
+        cmd2, data2 = await self.get_response(req_uuid, timeout)
         if cmd2 == cmd:
             return data2
         else:
-            raise ProtocolError(f'Requests "{req}" while responses "{Protocol.make_resp(req_uuid, cmd2, data2)}"')
+            req = Protocol.make_req(req_uuid, cmd, data)
+            resp = Protocol.make_resp(req_uuid, cmd2, data2)
+            raise ProtocolError(f'Send: {req}; Receive: {resp}.')
 
     """
     Frame format of UDP Protocol Data Relay.
@@ -275,87 +317,98 @@ class Protocol:
         |                                                                       |
         +--------+--------+--------+--------+--------+--------+--------+--------+
     """
-    UDP_PACKET_HEADER_LEN = 8
+    UDP_SYNC_HEADER_LEN = 8
     UDP_DATA_HEADER_LEN = 16
     __UDP_SYNC_FLAG = b'\x53\x59'  # 'SY'
     __UDP_DATA_FLAG = b'\x44\x41'  # 'DA'
 
     class UdpPacketType:
-        UNKNOWN = 0
-        SYNC = 1
-        DATA = 2
+        SYNC = 'SYNC'
+        DATA = 'DATA'
+        UNKNOWN = 'UNKNOWN'
+
+    class UdpPacketInfo:
+        TYPE = 'type'
+        TIMESTAMP = 'timestamp'
+        SERVER_PORT = 'server_port'
+        USER_ADDRESS = 'user_address'
+        B_USER_DATA = 'b_user_data'
 
     @staticmethod
-    def make_datagram_header(pkt_type, **kwargs):
+    def pack_udp_sync_packet(**kwargs):  # raise: struct.error
         """
-        构造UDP数据包的包头，根据不同的包类型进行组装。
-        :param pkt_type: UdpPacketType
-        :param kwargs: UdpPacketType.SYNC(info); UdpPacketType.DATA(proxy_port, user_address, data_length)
-        :return: bytes of datagram header
+        合成udp sync二进制数据包。
+        :param kwargs: 用户需要传递的参数
+        :return: udp sync packet
+        @throws: ProtocolError, struct.error
         """
-        if pkt_type == Protocol.UdpPacketType.SYNC:
-            if 'info' not in kwargs:
-                raise ProtocolError('make_datagram_header without parameter `info` given')
-            info = kwargs['info']
-            timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-            b_data = f'{info}{Protocol.SEPARATOR}{timestamp}'.encode()
-            length = Protocol.UDP_PACKET_HEADER_LEN + len(b_data)
-            b_len = length.to_bytes(length=4, byteorder='big', signed=False)
-            b_crc = b'\x55\x55'
-            return Protocol.__UDP_SYNC_FLAG + b_len + b_crc + b_data
+        kwargs[Protocol.UdpPacketInfo.TIMESTAMP] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        val_list = (f'{k}={kwargs[k]}' for k in kwargs)
+        b_data = Protocol.PARAM_SEPARATOR.join(val_list).encode()
+        length = Protocol.UDP_SYNC_HEADER_LEN + len(b_data)
+        b_len = struct.pack('>I', length)  # length.to_bytes(length=4, byteorder='big', signed=False)
+        b_crc = b'\x55\x55'
+        return b''.join((Protocol.__UDP_SYNC_FLAG, b_len, b_crc, b_data))
 
-        elif pkt_type == Protocol.UdpPacketType.DATA:
-            for k in ('proxy_port', 'user_address', 'data_length'):
-                if k not in kwargs:
-                    raise ProtocolError('make_datagram_header without parameter `%s` given' % k)
-            proxy_port = kwargs['proxy_port']
-            user_host = kwargs['user_address'][0]
-            user_port = kwargs['user_address'][1]
-            data_length = kwargs['data_length']
-            if user_host == '':
-                user_host = '127.0.0.1'
-            elif len(user_host.split('.')) != 4:
-                raise ProtocolError
-            b_proxy_port = int(proxy_port).to_bytes(length=2, byteorder='big', signed=False)
-            b_user_host = bytes(map(int, user_host.split('.')))
-            b_user_port = int(user_port).to_bytes(length=2, byteorder='big', signed=False)
-            length = Protocol.UDP_DATA_HEADER_LEN + data_length
-            b_len = length.to_bytes(length=4, byteorder='big', signed=False)
-            b_crc = b'\x55\x55'
-            return Protocol.__UDP_DATA_FLAG + b_len + b_crc + b_proxy_port + b_user_host + b_user_port
+    @staticmethod
+    def pack_udp_data_packet(server_port, user_address, b_user_data, pack_data=True):
+        """
+        合成udp data二进制数据包。
+        :param server_port:
+        :param user_address:
+        :param b_user_data:
+        :param pack_data:
+        :return: udp data packet
+        @throws: ProtocolError, struct.error
+        """
+        user_host = user_address[0] if user_address[0] else '127.0.0.1'
+        user_port = user_address[1]
+        if len(user_host.split('.')) != 4:
+            raise ProtocolError(f'Invalid ip address of user_host({user_host}) is given.')
+        b_proxy_port = struct.pack('>H', server_port)
+        b_user_host = bytes(map(int, user_host.split('.')))
+        b_user_port = struct.pack('>H', user_port)
+        b_len = struct.pack('>I', Protocol.UDP_DATA_HEADER_LEN + len(b_user_data))
+        b_crc = b'\x55\x55'
+        return b''.join((Protocol.__UDP_DATA_FLAG, b_len, b_crc, b_proxy_port, b_user_host, b_user_port, b_user_data)) \
+            if pack_data else b''.join((Protocol.__UDP_DATA_FLAG, b_len, b_crc, b_proxy_port, b_user_host, b_user_port))
 
+    @staticmethod
+    def unpack_udp_packet(packet, unpack_data=False):
+        """
+        将二进制数据包解析成字典参数返回。
+        :param packet:
+        :param unpack_data:
+        :return: dict result
+        @throws: ProtocolError, struct.error
+        """
+        result = {Protocol.UdpPacketInfo.TYPE: Protocol.UdpPacketType.UNKNOWN}
+
+        len_packet = len(packet)
+        if len_packet != struct.unpack('>I', packet[2:6])[0]:
+            raise ProtocolError('Checking LENGTH of udp packet failed.')
+        if packet[6:8] != b'\x55\x55':
+            raise ProtocolError('Checking CRC of udp data packet failed.')
+
+        if packet[0:2] == Protocol.__UDP_SYNC_FLAG:
+            if len_packet < Protocol.UDP_SYNC_HEADER_LEN:
+                raise ProtocolError('Checking LENGTH of udp sync packet failed.')
+            val_list = packet[Protocol.UDP_SYNC_HEADER_LEN:].decode().split(Protocol.PARAM_SEPARATOR)
+            for val in val_list:
+                val_pair = val.split('=', 1)
+                if len(val_pair) != 2:
+                    raise ProtocolError('Invalid parameter in udp sync packet.')
+                result[val_pair[0]] = val_pair[1]
+            result[Protocol.UdpPacketInfo.TYPE] = Protocol.UdpPacketType.SYNC
+        elif packet[0:2] == Protocol.__UDP_DATA_FLAG:
+            if len_packet < Protocol.UDP_DATA_HEADER_LEN:
+                raise ProtocolError('Checking LENGTH of udp data packet failed.')
+            result[Protocol.UdpPacketInfo.SERVER_PORT] = struct.unpack('>H', packet[8:10])[0]
+            result[Protocol.UdpPacketInfo.USER_ADDRESS] = (
+                '.'.join(str(x) for x in list(packet[10:14])), struct.unpack('>H', packet[14:16])[0])
+            if unpack_data:
+                result[Protocol.UdpPacketInfo.B_USER_DATA] = packet[Protocol.UDP_DATA_HEADER_LEN:]
+            result[Protocol.UdpPacketInfo.TYPE] = Protocol.UdpPacketType.DATA
         else:
-            raise ProtocolError('Unsupported udp packet type.')
-
-    @staticmethod
-    def parse_datagram_header(pkt):
-        """
-        解析UDP数据包的包头，并根据包的类型返回相应的参数。
-        :param pkt:
-        :return: (UdpPacketType.UNKNOWN, (None,)),
-                 or (UdpPacketType.SYNC, (info, timestamp)),
-                 or (UdpPacketType.DATA, (proxy_port, user_address)).
-        """
-        try:
-            if pkt[0:2] == Protocol.__UDP_SYNC_FLAG:
-                if pkt[6:8] != b'\x55\x55':
-                    raise ProtocolError
-                # Skip checking packet length ...
-                #
-                info, timestamp = pkt[Protocol.UDP_PACKET_HEADER_LEN:].decode().rsplit(Protocol.SEPARATOR, 1)
-                return Protocol.UdpPacketType.SYNC, (info, timestamp)
-
-            elif pkt[0:2] == Protocol.__UDP_DATA_FLAG:
-                if pkt[6:8] != b'\x55\x55':
-                    raise ProtocolError
-                # Skip checking packet length ...
-                #
-                proxy_port = int.from_bytes(pkt[8:10], byteorder='big', signed=False)
-                user_host = '.'.join(str(x) for x in list(pkt[10:14]))
-                user_port = int.from_bytes(pkt[14:16], byteorder='big', signed=False)
-                return Protocol.UdpPacketType.DATA, (proxy_port, (user_host, user_port))
-
-            else:
-                raise ProtocolError
-        except ProtocolError:
-            return Protocol.UdpPacketType.UNKNOWN, (None, )
+            raise ProtocolError('Unrecognised udp packet.')
+        return result

@@ -1,16 +1,16 @@
+import sys
 import asyncio
 import socket
 import time
 from datetime import datetime
 from uuid import uuid4
 from protocol import Protocol
-from common import ProxyError, ProxyStatus as _Status
+from common import ProxyError, RunningStatus
 from utils import check_python_version, check_listening
 from loguru import logger as log
 
 
 class TcpMapInfo:
-    CLIENT_PORT = 'client_port'
     SERVER_PORT = 'server_port'
     SWITCH = 'is_running'
     STATISTIC = 'statistic'
@@ -18,7 +18,6 @@ class TcpMapInfo:
 
 
 class UdpMapInfo:
-    CLIENT_PORT = 'client_port'
     SERVER_PORT = 'server_port'
     SWITCH = 'is_running'
     STATISTIC = 'statistic'
@@ -28,51 +27,186 @@ class UdpMapInfo:
 class ProxyClient:
     """端口代理转发类（客户端）
     """
-
-    def __init__(self, server_host, server_port=10000, port_map=None, client_name='DefaultClient'):
-        if type(server_port) != int:
-            raise ProxyError('Invalid argument for `server_port`: %s' % server_port)
-        if not port_map:
-            raise ProxyError('Invalid argument for `port_map`: %s' % port_map)
+    def __init__(self, server_host, server_port=10000, port_map=None, cid=None, name='DefaultClient'):
         for maps in (port_map['TCP'], port_map['UDP']):
             for p in maps:
                 if type(p) != int or type(maps[p]) != int or list(maps.values()).count(maps[p]) != 1:
-                    raise ProxyError('Invalid argument for `port_map`: %s' % port_map)
-        check_python_version(3, 7)
+                    raise ValueError('Invalid argument for `port_map`: %s' % port_map)
+        server_host = socket.gethostbyname(server_host)
+        server_port = int(server_port)
 
-        self.client_id = None                   # Generates by server after connection
-        self.client_name = client_name          # User defined name
-        self.server_host = server_host          # server side host address
-        self.server_port = server_port          # for both tcp and udp service
+        self.client_id = cid                    # generates by server after connection if not provided.
+        self.client_name = name                 # user defined client name.
+        self.server_host = server_host          # server side host address.
+        self.server_port = server_port          # for both tcp and udp service.
 
-        self.ini_tcp_map = port_map['TCP']      # = {80: 10080, 81: 10081}
-        self.ini_udp_map = port_map['UDP']      # = {80: 10080}
+        self.ini_tcp_map = port_map['TCP']      # = {80: 10080, 81: 10081, ...}
+        self.ini_udp_map = port_map['UDP']      # = {80: 10080, ...}
 
-        self.tcp_maps = {}                      #
-        self.udp_maps = {}                      #
+        self.tcp_maps = None                    # tcp proxy map
+        self.udp_maps = None                    # udp proxy map
 
-        self.__udp_socket = None                # socket for udp packet relay
-        self.__udp_req_map = {}                 #
+        self.__udp_socket = None                # socket for receiving udp packet from server to local udp service.
+        self.__udp_req_map = None               # socket for feedback udp packet from local udp service to server.
 
-        self.__protocol = None                  #
-        self.__task_serve_req = None            #
-        self.__task_udp_accept = None           #
-        self.__task_udp_feedback = None         #
-        self.__task_daemon = None               #
-        self.__task_watchdog = None             #
+        self.__protocol = None                  # tcp connection used to communicate with server.
+        self.__task_serve_req = None            # task for processing requests form server.
+        self.__task_udp_receive = None          # task for receiving udp packet form server.
+        self.__task_udp_feedback = None         # task for feedback udp packet to server.
+        self.__task_daemon = None               # task for daemon
 
-        self.status = _Status.PREPARE           # 运行状态
-        self.timestamp = datetime.utcnow()      # 服务创建时间
+        self.status = RunningStatus.PREPARE     # PREPARE -> RUNNING (-> PENDING) -> STOPPED
+        self.ping = time.time()                 # the period when the last udp ping receives.
+        self.timestamp = datetime.utcnow()      # the period when proxy client creates.
 
-    async def __tcp_data_relay_task(self, client_port, stream_1, stream_2):
+    def tcp_statistic(self, upstream=None, downstream=None):
+        if upstream is None:
+            self.__protocol.tcp_statistic[0] = 0
+        else:
+            self.__protocol.tcp_statistic[0] += upstream
+        if downstream is None:
+            self.__protocol.tcp_statistic[1] = 0
+        else:
+            self.__protocol.tcp_statistic[1] += downstream
+        return tuple(self.__protocol.tcp_statistic)
 
-        async def data_relay_monitor(mappings, _port):
+    def udp_statistic(self, upstream=None, downstream=None):
+        if upstream is None:
+            self.__protocol.udp_statistic[0] = 0
+        else:
+            self.__protocol.udp_statistic[0] += upstream
+        if downstream is None:
+            self.__protocol.udp_statistic[1] = 0
+        else:
+            self.__protocol.udp_statistic[1] += downstream
+        return tuple(self.__protocol.udp_statistic)
+
+    def _map_msg(self, client_port, server_port, status, extra=None):
+        return f'{ sys._getframe(1).f_code.co_name.upper() }: ' \
+               f'Local({client_port}) >>> {self.server_host}({server_port}) ... ' \
+               f'[{ status.upper() }]{ " (" + extra + ")" if extra else "" }'
+
+    async def add_tcp_map(self, client_port, server_port):
+        if client_port in self.tcp_maps:
+            raise ProxyError(self._map_msg(client_port, server_port, 'ERROR', f'already registered.'))
+        status, detail = (await self.__protocol.request(
+            Protocol.ClientCommand.ADD_TCP_MAP, f'{client_port}{Protocol.PARAM_SEPARATOR}{server_port}',
+            Protocol.CONNECTION_TIMEOUT)).split(Protocol.PARAM_SEPARATOR, 1)
+        if status != Protocol.Result.SUCCESS:
+            raise ProxyError(self._map_msg(client_port, server_port, 'ERROR', detail))
+        self.tcp_maps[client_port] = {
+            TcpMapInfo.SERVER_PORT: server_port,
+            TcpMapInfo.SWITCH: True,
+            TcpMapInfo.STATISTIC: [0, 0],
+            TcpMapInfo.CREATE_TIME: datetime.utcnow(),
+        }
+        log.success(self._map_msg(client_port, server_port, 'OK'))
+
+    async def pause_tcp_map(self, client_port):
+        if client_port not in self.tcp_maps:
+            raise ProxyError(self._map_msg(client_port, None, 'ERROR', f'not registered.'))
+        else:
+            server_port = self.tcp_maps[client_port][TcpMapInfo.SERVER_PORT]
+        status, detail = (await self.__protocol.request(
+                Protocol.ClientCommand.PAUSE_TCP_MAP, f'{self.tcp_maps[client_port][TcpMapInfo.SERVER_PORT]}',
+                Protocol.CONNECTION_TIMEOUT)).split(Protocol.PARAM_SEPARATOR, 1)
+        if status != Protocol.Result.SUCCESS:
+            raise ProxyError(self._map_msg(client_port, server_port, 'ERROR'), detail)
+        self.tcp_maps[client_port][TcpMapInfo.SWITCH] = False
+        log.success(self._map_msg(client_port, server_port, 'OK'))
+
+    async def resume_tcp_map(self, client_port):
+        if client_port not in self.tcp_maps:
+            raise ProxyError(self._map_msg(client_port, None, 'ERROR', f'not registered.'))
+        else:
+            server_port = self.tcp_maps[client_port][TcpMapInfo.SERVER_PORT]
+        status, detail = (await self.__protocol.request(
+                Protocol.ClientCommand.RESUME_TCP_MAP, f'{self.tcp_maps[client_port][TcpMapInfo.SERVER_PORT]}',
+                Protocol.CONNECTION_TIMEOUT)).split(Protocol.PARAM_SEPARATOR, 1)
+        if status != Protocol.Result.SUCCESS:
+            raise ProxyError(self._map_msg(client_port, server_port, 'ERROR'), detail)
+        self.tcp_maps[client_port][TcpMapInfo.SWITCH] = True
+        log.success(self._map_msg(client_port, server_port, 'OK'))
+
+    async def remove_tcp_map(self, client_port):
+        if client_port not in self.tcp_maps:
+            raise ProxyError(self._map_msg(client_port, None, 'ERROR', f'not registered.'))
+        else:
+            server_port = self.tcp_maps[client_port][TcpMapInfo.SERVER_PORT]
+        status, detail = (await self.__protocol.request(
+                Protocol.ClientCommand.REMOVE_TCP_MAP, f'{self.tcp_maps[client_port][TcpMapInfo.SERVER_PORT]}',
+                Protocol.CONNECTION_TIMEOUT)).split(Protocol.PARAM_SEPARATOR, 1)
+        if status != Protocol.Result.SUCCESS:
+            raise ProxyError(self._map_msg(client_port, server_port, 'ERROR'), detail)
+        del self.tcp_maps[client_port]
+        log.success(self._map_msg(client_port, server_port, 'OK'))
+
+    async def add_udp_map(self, client_port, server_port):
+        if client_port in self.udp_maps:
+            raise ProxyError(self._map_msg(client_port, server_port, 'ERROR', f'already registered.'))
+        status, detail = (await self.__protocol.request(
+                Protocol.ClientCommand.ADD_UDP_MAP, f'{client_port}{Protocol.PARAM_SEPARATOR}{server_port}',
+                Protocol.CONNECTION_TIMEOUT)).split(Protocol.PARAM_SEPARATOR, 1)
+        if status != Protocol.Result.SUCCESS:
+            raise ProxyError(self._map_msg(client_port, server_port, 'ERROR'), detail)
+        self.udp_maps[client_port] = {
+            UdpMapInfo.SERVER_PORT: server_port,
+            UdpMapInfo.SWITCH: True,
+            UdpMapInfo.STATISTIC: [0, 0],
+            UdpMapInfo.CREATE_TIME: datetime.utcnow(),
+        }
+        log.success(self._map_msg(client_port, server_port, 'OK'))
+
+    async def pause_udp_map(self, client_port):
+        if client_port not in self.udp_maps:
+            raise ProxyError(self._map_msg(client_port, None, 'ERROR', f'not registered.'))
+        else:
+            server_port = self.udp_maps[client_port][UdpMapInfo.SERVER_PORT]
+        status, detail = (await self.__protocol.request(
+                Protocol.ClientCommand.PAUSE_UDP_MAP, f'{self.udp_maps[client_port][UdpMapInfo.SERVER_PORT]}',
+                Protocol.CONNECTION_TIMEOUT)).split(Protocol.PARAM_SEPARATOR, 1)
+        if status != Protocol.Result.SUCCESS:
+            raise ProxyError(self._map_msg(client_port, server_port, 'ERROR'), detail)
+        self.udp_maps[client_port][UdpMapInfo.SWITCH] = False
+        log.success(self._map_msg(client_port, server_port, 'OK'))
+
+    async def resume_udp_map(self, client_port):
+        if client_port not in self.udp_maps:
+            raise ProxyError(self._map_msg(client_port, None, 'ERROR', f'not registered.'))
+        else:
+            server_port = self.udp_maps[client_port][UdpMapInfo.SERVER_PORT]
+        status, detail = (await self.__protocol.request(
+                Protocol.ClientCommand.RESUME_UDP_MAP, f'{self.udp_maps[client_port][UdpMapInfo.SERVER_PORT]}',
+                Protocol.CONNECTION_TIMEOUT)).split(Protocol.PARAM_SEPARATOR, 1)
+        if status != Protocol.Result.SUCCESS:
+            raise ProxyError(self._map_msg(client_port, server_port, 'ERROR'), detail)
+        self.udp_maps[client_port][UdpMapInfo.SWITCH] = True
+        log.success(self._map_msg(client_port, server_port, 'OK'))
+
+    async def remove_udp_map(self, client_port):
+        if client_port not in self.udp_maps:
+            raise ProxyError(self._map_msg(client_port, None, 'ERROR', f'not registered.'))
+        else:
+            server_port = self.udp_maps[client_port][UdpMapInfo.SERVER_PORT]
+        status, detail = (await self.__protocol.request(
+                Protocol.ClientCommand.REMOVE_UDP_MAP, f'{self.udp_maps[client_port][UdpMapInfo.SERVER_PORT]}',
+                Protocol.CONNECTION_TIMEOUT)).split(Protocol.PARAM_SEPARATOR, 1)
+        if status != Protocol.Result.SUCCESS:
+            raise ProxyError(self._map_msg(client_port, server_port, 'ERROR'), detail)
+        del self.udp_maps[client_port]
+        log.success(self._map_msg(client_port, server_port, 'OK'))
+
+    async def __tcp_data_relay_task(self, client_port, sock_stream, peer_stream):
+
+        async def data_relay_monitor():
             while True:
-                if _port not in mappings or not mappings[_port][TcpMapInfo.SWITCH]:
+                if self.status == RunningStatus.RUNNING and client_port in self.tcp_maps \
+                        and self.tcp_maps[client_port][TcpMapInfo.SWITCH]:
+                    await asyncio.sleep(Protocol.TASK_SCHEDULE_PERIOD)
+                else:
                     break
-                await asyncio.sleep(Protocol.TASK_SCHEDULE_PERIOD)
 
-        async def simplex_data_relay(reader, writer):
+        async def simplex_data_relay(reader, writer, upstream=True):
             while True:
                 try:
                     data = await reader.read(Protocol.SOCKET_BUFFER_SIZE)
@@ -80,146 +214,180 @@ class ProxyClient:
                         break
                     writer.write(data)
                     await writer.drain()
-                    self.tcp_maps[client_port][TcpMapInfo.STATISTIC] += len(data)
-                except ConnectionError:
+                    self.tcp_maps[client_port][TcpMapInfo.STATISTIC][0 if upstream else 1] += len(data)
+                except IOError:
                     break
 
         server_port = self.tcp_maps[client_port][TcpMapInfo.SERVER_PORT]
+        rp = peer_stream[1].get_extra_info("sockname")[1]
+        log.info(f'Server({server_port}) ----> {self.client_id}({client_port}) [{rp}]')
         _, pending = await asyncio.wait({
-            asyncio.create_task(data_relay_monitor(self.tcp_maps, client_port)),
-            asyncio.create_task(simplex_data_relay(stream_1[0], stream_2[1])),
-            asyncio.create_task(simplex_data_relay(stream_2[0], stream_1[1])),
+            asyncio.create_task(data_relay_monitor()),
+            asyncio.create_task(simplex_data_relay(sock_stream[0], peer_stream[1], upstream=True)),
+            asyncio.create_task(simplex_data_relay(peer_stream[0], sock_stream[1], upstream=False)),
         }, return_when=asyncio.FIRST_COMPLETED)
         for task in pending:
             task.cancel()
-        stream_1[1].close()
-        stream_2[1].close()
-        log.info(f'Local({client_port}) --x-> {self.server_host}({server_port})')
+        sock_stream[1].close()
+        peer_stream[1].close()
+        log.info(f'Server({server_port}) --x-> {self.client_id}({client_port}) [{rp}]')
 
     async def __serve_request_task(self):
         while True:
-            uuid, cmd, data = await self.__protocol.get_request()
-            result = None
+            uuid, cmd, data = await self.__protocol.get_request(timeout=None)
+            result = Protocol.PARAM_SEPARATOR.join((Protocol.Result.SUCCESS, ''))
             try:
                 if cmd == Protocol.Command.PING:
-                    result = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+                    result += datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
 
                 elif cmd == Protocol.ServerCommand.ADD_TCP_CONNECTION:
-                    try:
-                        client_port = int(data)
-                        server_port = self.tcp_maps[client_port][TcpMapInfo.SERVER_PORT]
-                        reader1, writer1 = await asyncio.open_connection('127.0.0.1', client_port)
-                        reader2, writer2 = await asyncio.open_connection(self.server_host, self.server_port)
-                        conn_uuid = uuid4().hex
-                        identify = (f'{Protocol.ConnectionType.PROXY_TCP_DATA}:'
-                                    f'{self.client_id}{Protocol.SEPARATOR}{server_port}{Protocol.SEPARATOR}{conn_uuid}')
-                        writer2.write((identify + '\n').encode())
-                        await writer2.drain()
-                        resp = (await reader2.readline()).decode().strip()
-                        if not resp or resp != Protocol.Result.SUCCESS:
-                            raise ProxyError('Add tcp connection failed while connecting to server.')
-                    except (ConnectionError, ProxyError) as e:
-                        log.warning(e)
-                        result = None
-                    else:
-                        log.info(f'Local({client_port}) ----> {self.server_host}({server_port})')
-                        asyncio.create_task(
-                            self.__tcp_data_relay_task(client_port, (reader1, writer1), (reader2, writer2)))
-                        result = conn_uuid
+                    client_port = int(data)
+                    server_port = self.tcp_maps[client_port][TcpMapInfo.SERVER_PORT]
+                    reader1, writer1 = await asyncio.open_connection('127.0.0.1', client_port)
+                    reader2, writer2 = await asyncio.open_connection(self.server_host, self.server_port)
+                    conn_uuid = uuid4().hex
+                    identify = Protocol.PARAM_SEPARATOR.join(
+                        (Protocol.ConnectionType.PROXY_TCP_DATA, self.client_id, str(server_port), conn_uuid))
+                    writer2.write((identify + '\n').encode())
+                    await writer2.drain()
+                    resp = (await reader2.readline()).decode().strip()
+                    if not resp or resp[:len(Protocol.Result.SUCCESS)] != Protocol.Result.SUCCESS:
+                        raise ProxyError('Add tcp connection failed while connecting to server.')
+                    asyncio.create_task(
+                        self.__tcp_data_relay_task(client_port, (reader1, writer1), (reader2, writer2)))
+                    result += conn_uuid
 
                 else:
-                    raise ValueError
-            except (ValueError, Exception):
-                result = Protocol.Result.INVALID
-                log.warning(f'Invalid request from Server: "{Protocol.make_req(uuid, cmd, data)}"')
+                    log.warning(f'Unrecognised request from Server: {Protocol.make_req(uuid, cmd, data)}')
+                    result = Protocol.PARAM_SEPARATOR.join((Protocol.Result.INVALID, 'unrecognised request'))
+
+            except Exception as e:
+                log.error(f'Error while processing request({Protocol.make_req(uuid, cmd, data)}): {e}')
+                result = Protocol.PARAM_SEPARATOR.join((Protocol.Result.ERROR, str(e)))
             finally:
-                await self.__protocol.send_response(uuid, cmd, result)
+                try:
+                    await self.__protocol.send_response(uuid, cmd, result)
+                except Exception as e:
+                    log.error(e)
+                    break
 
-    def __udp_send_data(self, data, udp_port, user_address):
-        key = hash((udp_port, user_address))
-        if key in self.__udp_req_map:
-            sock = self.__udp_req_map[key][2]
-            self.__udp_req_map[key][3] = time.time()
-        else:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setblocking(False)
-            self.__udp_req_map[key] = [udp_port, user_address, sock, time.time()]
-        sock.sendto(data, ('', udp_port))
+    async def __udp_receive_task(self):
 
-    async def __udp_accept_task(self):
+        def udp_send_data(__b_data, __udp_port, __user_address):
+            key = hash((__udp_port, __user_address))
+            if key in self.__udp_req_map:
+                sock = self.__udp_req_map[key][2]
+                self.__udp_req_map[key][3] = time.time()
+            else:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.setblocking(False)
+                self.__udp_req_map[key] = [__udp_port, user_address, sock, time.time()]
+            sock.sendto(__b_data, ('127.0.0.1', __udp_port))
+
         while True:
             try:
                 data, address = self.__udp_socket.recvfrom(Protocol.SOCKET_BUFFER_SIZE)
             except BlockingIOError:
                 await asyncio.sleep(Protocol.TASK_SCHEDULE_PERIOD)
                 continue
-            # if address[0] != self.server_host:
-            #    log.warning(f'Illegal udp packet form {address}, not the server.')
-            #    continue
-            pkt_type, values = Protocol.parse_datagram_header(data)
-            if pkt_type == Protocol.UdpPacketType.SYNC:
-                log.info(f'UDP_PING: {values[1]}')  # f'Received UDP ping response from server at: {values[1]}'
-            elif pkt_type == Protocol.UdpPacketType.DATA:  # or address[1] != values[0]:
-                user_address = values[1]
-                server_port = values[0]
-                client_port = None
-                for port in self.udp_maps:
-                    if self.udp_maps[port][UdpMapInfo.SERVER_PORT] == server_port:
-                        client_port = port
-                        break
-                if not client_port:
-                    log.warning(f'Udp proxy port({server_port}) is not registered.')
-                    continue
-                self.__udp_send_data(data[Protocol.UDP_DATA_HEADER_LEN:], client_port, user_address)
-                log.debug(f'Accept data packet from {user_address} on port({client_port})')
-            else:
-                log.warning(f'Invalid udp packet from {address}, format is unknown.')
-                continue
+            except IOError as e:
+                log.error(e)
+                break
+
+            try:
+                # if address[0] != self.server_host:
+                #    raise ProxyError(f'Received udp packet from {address} which is not the server.')
+                try:
+                    packet_info = Protocol.unpack_udp_packet(data, unpack_data=False)
+                except Exception as e:
+                    raise ProxyError(f'Protocol.unpack_udp_packet(): {e}')
+                if packet_info[Protocol.UdpPacketInfo.TYPE] == Protocol.UdpPacketType.SYNC:
+                    self.udp_statistic(0, len(data))
+                    self.__udp_ping = time.time()
+                    log.debug(f'UDP_PING: {packet_info[Protocol.UdpPacketInfo.TIMESTAMP]}')
+                elif packet_info[Protocol.UdpPacketInfo.TYPE] == Protocol.UdpPacketType.DATA:
+                    self.udp_statistic(0, Protocol.UDP_DATA_HEADER_LEN)
+                    self.udp_maps[UdpMapInfo.STATISTIC][1] += len(data) - Protocol.UDP_DATA_HEADER_LEN
+                    user_address = packet_info[Protocol.UdpPacketInfo.USER_ADDRESS]
+                    server_port = packet_info[Protocol.UdpPacketInfo.SERVER_PORT]
+                    client_port = None
+                    for port in self.udp_maps:
+                        if self.udp_maps[port][UdpMapInfo.SERVER_PORT] == server_port:
+                            client_port = port
+                            break
+                    if not client_port:
+                        log.warning(f'Received udp data packet on server port({server_port}) that not registered.')
+                        continue
+                    try:
+                        udp_send_data(data[Protocol.UDP_DATA_HEADER_LEN:], client_port, user_address)
+                    except IOError as e:
+                        log.error(e)
+                        continue
+                    log.debug(f'Received udp data packet from {user_address} on port({client_port})')
+                else:
+                    self.udp_statistic(0, len(data))
+                    raise ProxyError(f'Received udp packet from {address} with unknown type.')
+            except Exception as e:
+                log.debug(f'Received udp packet from: {address}, data:\n' + data.hex())
+                log.warning(e)
+        self.__protocol.close()
 
     async def __udp_feedback_task(self):
         while True:
-            for key in self.__udp_req_map:
+            for key in list(self.__udp_req_map):
                 client_port, user_address, sock, _ = self.__udp_req_map[key]
-                while True:
-                    try:
-                        data = sock.recv(Protocol.SOCKET_BUFFER_SIZE)
-                    except BlockingIOError:
-                        break
-                    header = Protocol.make_datagram_header(
-                        Protocol.UdpPacketType.DATA,
-                        proxy_port=self.udp_maps[client_port][UdpMapInfo.SERVER_PORT],
-                        user_address=user_address, data_length=len(data))
-                    sock.sendto(header + data, (self.server_host, self.server_port))
-                    log.debug(f'Sent feedback to server port({self.server_port})')
+                try:
+                    while True:
+                        try:
+                            data = sock.recv(Protocol.SOCKET_BUFFER_SIZE)
+                        except BlockingIOError:
+                            break
+                        data_packet = Protocol.pack_udp_data_packet(
+                            self.udp_maps[client_port][UdpMapInfo.SERVER_PORT], user_address, data, pack_data=True)
+                        sock.sendto(data_packet, (self.server_host, self.server_port))
+                        self.udp_statistic(Protocol.UDP_DATA_HEADER_LEN, 0)
+                        self.udp_maps[UdpMapInfo.STATISTIC][0] += len(data)
+                        log.debug(f'Sent feedback to server port({self.server_port})')
+                except IOError as e:
+                    log.error(e)
+                    val = self.__udp_req_map.pop(key)
+                    val[2].close()
             await asyncio.sleep(Protocol.TASK_SCHEDULE_PERIOD)
 
     async def __daemon_task(self):
         cnt = 0
+        await asyncio.sleep(Protocol.CLIENT_UDP_PING_PERIOD)
         while True:
             #
-            # Keep TCP Channel alive.
+            # Send tcp keep alive message.
             #
             if not (cnt % Protocol.CLIENT_TCP_PING_PERIOD):
                 try:
-                    timestamp = await self.__protocol.request(Protocol.Command.PING,
-                                                              datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
-                                                              Protocol.CONNECTION_TIMEOUT)
-                    log.info(f'TCP_PING: {timestamp}')  # f'Received TCP ping response from server at: {timestamp}'
-                except asyncio.TimeoutError:
-                    log.warning('Receive TCP ping response from server timeout.')
+                    await self.__protocol.request(Protocol.Command.PING, timeout=Protocol.CONNECTION_TIMEOUT)
+                except Exception as e:
+                    log.error(e)
+                    break
             #
-            # Keep UDP Channel alive.
+            # Send udp keep alive data packet.
             #
             if not (cnt % Protocol.CLIENT_UDP_PING_PERIOD):
-                pkt = Protocol.make_datagram_header(Protocol.UdpPacketType.SYNC, info=self.client_id)
-                self.__udp_socket.sendto(pkt, (self.server_host, self.server_port))
+                data_packet = Protocol.pack_udp_sync_packet(client_id=self.client_id)
+                try:
+                    self.__udp_socket.sendto(data_packet, (self.server_host, self.server_port))
+                except IOError as e:
+                    log.error(e)
                 # log.debug(f'Sent UDP ping packet to server({self.server_host}:{self.server_port})')
             #
-            # Remove udp socket connections that is too old.
+            #  Check if udp keep alive data packet received in time.
             #
-            timestamp = time.time()
+            if time.time() - self.__udp_ping > Protocol.UDP_UNREACHABLE_WARNING_PERIOD:
+                log.warning('Too many udp ping packet lost!')
+                self.__udp_ping += Protocol.CLIENT_UDP_PING_PERIOD
+            #
+            # Remove virtual udp connections in `self.__udp_req_map` which is too old.
+            #
             for key in list(self.__udp_req_map.keys()):
-                if timestamp - self.__udp_req_map[key][3] > Protocol.UDP_REQUEST_DEADLINE:
+                if time.time() - self.__udp_req_map[key][3] > Protocol.UDP_REQUEST_DURATION:
                     val = self.__udp_req_map.pop(key)
                     val[2].close()
             #
@@ -228,284 +396,151 @@ class ProxyClient:
             cnt += 1
             await asyncio.sleep(1)
 
-    async def __watchdog_task(self):
-        await self.__protocol.wait_closed()
+        self.__protocol.close()  # kill itself.
 
-        self.__task_serve_req.cancel()
-        self.__task_udp_accept.cancel()
-        self.__task_udp_feedback.cancel()
-        self.__task_daemon.cancel()
-
-        self.status = _Status.STOPPED
-        log.warning('Watchdog is activated, and the proxy client will be terminated ...')
-
-    async def add_tcp_map(self, client_port, server_port):
-        try:
-            if client_port in self.tcp_maps:
-                raise ProxyError
-            if Protocol.Result.SUCCESS != await self.__protocol.request(
-                    Protocol.ClientCommand.ADD_TCP_MAP,
-                    f'{client_port}:{server_port}',
-                    Protocol.CONNECTION_TIMEOUT):
-                raise ProxyError
-            self.tcp_maps[client_port] = {
-                TcpMapInfo.CLIENT_PORT: client_port,
-                TcpMapInfo.SERVER_PORT: server_port,
-                TcpMapInfo.SWITCH: False,
-                TcpMapInfo.STATISTIC: 0,
-                TcpMapInfo.CREATE_TIME: datetime.utcnow(),
-            }
-        except ProxyError:
-            log.error(f'ADD_TCP_MAP: Local({client_port}) >>> {self.server_host}({server_port}) ... [ERROR]')
-            return False
-        else:
-            log.success(f'ADD_TCP_MAP: Local({client_port}) >>> {self.server_host}({server_port}) ... [OK]')
-            return True
-
-    async def start_tcp_map(self, client_port):
-        server_port = None
-        try:
-            if client_port in self.tcp_maps:
-                server_port = self.tcp_maps[client_port][TcpMapInfo.SERVER_PORT]
-            else:
-                raise ProxyError
-            if not self.tcp_maps[client_port][TcpMapInfo.SWITCH]:
-                if Protocol.Result.SUCCESS != await self.__protocol.request(
-                        Protocol.ClientCommand.START_TCP_MAP,
-                        f'{self.tcp_maps[client_port][TcpMapInfo.SERVER_PORT]}',
-                        Protocol.CONNECTION_TIMEOUT):
-                    raise ProxyError
-            self.tcp_maps[client_port][TcpMapInfo.SWITCH] = True
-        except ProxyError:
-            log.error(f'START_TCP_MAP: Local({client_port}) >>> {self.server_host}({server_port}) ... [ERROR]')
-            return False
-        else:
-            log.success(f'START_TCP_MAP: Local({client_port}) >>> {self.server_host}({server_port}) ... [OK]')
-            return True
-
-    async def stop_tcp_map(self, client_port):
-        server_port = None
-        try:
-            if client_port in self.tcp_maps:
-                server_port = self.tcp_maps[client_port][TcpMapInfo.SERVER_PORT]
-            else:
-                raise ProxyError
-            if self.tcp_maps[client_port][TcpMapInfo.SWITCH]:
-                if Protocol.Result.SUCCESS != await self.__protocol.request(
-                        Protocol.ClientCommand.STOP_TCP_MAP,
-                        f'{self.tcp_maps[client_port][TcpMapInfo.SERVER_PORT]}',
-                        Protocol.CONNECTION_TIMEOUT):
-                    raise ProxyError
-            self.tcp_maps[client_port][TcpMapInfo.SWITCH] = False
-        except ProxyError:
-            log.error(f'STOP_TCP_MAP: Local({client_port}) >>> {self.server_host}({server_port}) ... [ERROR]')
-            return False
-        else:
-            log.success(f'STOP_TCP_MAP: Local({client_port}) >>> {self.server_host}({server_port}) ... [OK]')
-            return True
-
-    async def remove_tcp_map(self, client_port):
-        server_port = None
-        try:
-            if client_port in self.tcp_maps:
-                server_port = self.tcp_maps[client_port][TcpMapInfo.SERVER_PORT]
-            else:
-                raise ProxyError
-            if Protocol.Result.SUCCESS != await self.__protocol.request(
-                    Protocol.ClientCommand.REMOVE_TCP_MAP,
-                    f'{self.tcp_maps[client_port][TcpMapInfo.SERVER_PORT]}',
-                    Protocol.CONNECTION_TIMEOUT):
-                raise ProxyError
-            del self.tcp_maps[client_port]
-        except ProxyError:
-            log.error(f'REMOVE_TCP_MAP: Local({client_port}) >>> {self.server_host}({server_port}) ... [ERROR]')
-            return False
-        else:
-            log.success(f'REMOVE_TCP_MAP: Local({client_port}) >>> {self.server_host}({server_port}) ... [OK]')
-            return True
-
-    async def add_udp_map(self, client_port, server_port):
-        try:
-            if client_port in self.udp_maps:
-                raise ProxyError
-            if Protocol.Result.SUCCESS != await self.__protocol.request(
-                    Protocol.ClientCommand.ADD_UDP_MAP,
-                    f'{client_port}:{server_port}',
-                    Protocol.CONNECTION_TIMEOUT):
-                raise ProxyError
-            self.udp_maps[client_port] = {
-                UdpMapInfo.CLIENT_PORT: client_port,
-                UdpMapInfo.SERVER_PORT: server_port,
-                UdpMapInfo.SWITCH: False,
-                UdpMapInfo.STATISTIC: 0,
-                UdpMapInfo.CREATE_TIME: datetime.utcnow(),
-            }
-        except ProxyError:
-            log.error(f'ADD_UDP_MAP: Local({client_port}) >>> {self.server_host}({server_port}) ... [ERROR]')
-            return False
-        else:
-            log.success(f'ADD_UDP_MAP: Local({client_port}) >>> {self.server_host}({server_port}) ... [OK]')
-            return True
-
-    async def start_udp_map(self, client_port):
-        server_port = None
-        try:
-            if client_port in self.udp_maps:
-                server_port = self.udp_maps[client_port][UdpMapInfo.SERVER_PORT]
-            else:
-                raise ProxyError
-            if not self.udp_maps[client_port][UdpMapInfo.SWITCH]:
-                if Protocol.Result.SUCCESS != await self.__protocol.request(
-                        Protocol.ClientCommand.START_UDP_MAP,
-                        f'{self.udp_maps[client_port][UdpMapInfo.SERVER_PORT]}',
-                        Protocol.CONNECTION_TIMEOUT):
-                    raise ProxyError
-            self.udp_maps[client_port][UdpMapInfo.SWITCH] = True
-        except ProxyError:
-            log.error(f'START_UDP_MAP: Local({client_port}) >>> {self.server_host}({server_port}) ... [ERROR]')
-            return False
-        else:
-            log.success(f'START_UDP_MAP: Local({client_port}) >>> {self.server_host}({server_port}) ... [OK]')
-            return True
-
-    async def stop_udp_map(self, client_port):
-        server_port = None
-        try:
-            if client_port in self.udp_maps:
-                server_port = self.udp_maps[client_port][UdpMapInfo.SERVER_PORT]
-            else:
-                raise ProxyError
-            if self.udp_maps[client_port][UdpMapInfo.SWITCH]:
-                if Protocol.Result.SUCCESS != await self.__protocol.request(
-                        Protocol.ClientCommand.STOP_UDP_MAP,
-                        f'{self.udp_maps[client_port][UdpMapInfo.SERVER_PORT]}',
-                        Protocol.CONNECTION_TIMEOUT):
-                    raise ProxyError
-            self.udp_maps[client_port][UdpMapInfo.SWITCH] = False
-        except ProxyError:
-            log.error(f'STOP_UDP_MAP: Local({client_port}) >>> {self.server_host}({server_port}) ... [ERROR]')
-            return False
-        else:
-            log.success(f'STOP_UDP_MAP: Local({client_port}) >>> {self.server_host}({server_port}) ... [OK]')
-            return True
-
-    async def remove_udp_map(self, client_port):
-        server_port = None
-        try:
-            if client_port in self.udp_maps:
-                server_port = self.udp_maps[client_port][UdpMapInfo.SERVER_PORT]
-            else:
-                raise ProxyError
-            if Protocol.Result.SUCCESS != await self.__protocol.request(
-                    Protocol.ClientCommand.REMOVE_UDP_MAP,
-                    f'{self.udp_maps[client_port][UdpMapInfo.SERVER_PORT]}',
-                    Protocol.CONNECTION_TIMEOUT):
-                raise ProxyError
-            del self.udp_maps[client_port]
-        except ProxyError:
-            log.error(f'REMOVE_UDP_MAP: Local({client_port}) >>> {self.server_host}({server_port}) ... [ERROR]')
-            return False
-        else:
-            log.success(f'REMOVE_UDP_MAP: Local({client_port}) >>> {self.server_host}({server_port}) ... [OK]')
-            return True
-
-    async def startup(self):
-        log.info(f'Trying to Connect to Server({self.server_host}:{self.server_port})')
+    async def __main_task(self):
+        if self.status == RunningStatus.RUNNING or self.status == RunningStatus.PENDING:
+            log.error('Abort starting up the Proxy Client as it is already running.')
+            return
+        log.info(f'Connecting with the Proxy Server({self.server_host}:{self.server_port}) ...')
         reader, writer = await asyncio.open_connection(self.server_host, self.server_port)
-        writer.write(f'{Protocol.ConnectionType.PROXY_CLIENT}:{self.client_name}\n'.encode())
+        identify = Protocol.PARAM_SEPARATOR.join(
+            (Protocol.ConnectionType.PROXY_CLIENT, self.client_id if self.client_id else "", self.client_name))
+        writer.write((identify + '\n').encode())
         await writer.drain()
-        resp = (await reader.readline()).decode().strip()
-        if resp and resp[:len(Protocol.Result.SUCCESS)] == Protocol.Result.SUCCESS:
-            self.client_id = resp[len(Protocol.Result.SUCCESS)+1:]
+        resp = (await reader.readline()).decode().strip().split(Protocol.PARAM_SEPARATOR)
+        if resp and resp[0] == Protocol.Result.SUCCESS:
+            self.client_id = resp[1]
             log.success(f'Connected!')
         else:
-            log.error(f'Error!')
-            exit(1)
+            log.error(f'Failed!')
+            return
+
+        self.tcp_maps = {}
+        self.udp_maps = {}
         self.__udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.__udp_socket.setblocking(False)
+        self.__udp_req_map = {}
+        self.__udp_ping = time.time()
 
         self.__protocol = Protocol((reader, writer))
         self.__task_serve_req = asyncio.create_task(self.__serve_request_task())
-        self.__task_udp_accept = asyncio.create_task(self.__udp_accept_task())
+        self.__task_udp_receive = asyncio.create_task(self.__udp_receive_task())
         self.__task_udp_feedback = asyncio.create_task(self.__udp_feedback_task())
         self.__task_daemon = asyncio.create_task(self.__daemon_task())
-        self.__task_watchdog = asyncio.create_task(self.__watchdog_task())
 
-        self.status = _Status.RUNNING
-        log.info('>>>>>>>> Proxy Client is now STARTED !!! <<<<<<<<')
+        self.status = RunningStatus.RUNNING
+        log.success('>>>>>>>> Proxy Client is now STARTED !!! <<<<<<<<')
+
         try:
             for tcp_port in self.ini_tcp_map:
-                if await self.add_tcp_map(tcp_port, self.ini_tcp_map[tcp_port]):
-                    await self.start_tcp_map(tcp_port)
+                await self.add_tcp_map(tcp_port, self.ini_tcp_map[tcp_port])
             for udp_port in self.ini_udp_map:
-                if await self.add_udp_map(udp_port, self.ini_udp_map[udp_port]):
-                    await self.start_udp_map(udp_port)
-        except (ProxyError, Exception) as e:
-            log.critical(e)
+                await self.add_udp_map(udp_port, self.ini_udp_map[udp_port])
+        except Exception as e:
+            log.error(e)
+            self.__protocol.close()
 
-        while self.status != _Status.STOPPED:
+        await self.__protocol.wait_closed()
+        log.warning('Stopping the Proxy Client ...')
+
+        self.__task_serve_req.cancel()
+        self.__task_udp_receive.cancel()
+        self.__task_udp_feedback.cancel()
+        self.__task_daemon.cancel()
+
+        for key in self.__udp_req_map:
+            self.__udp_req_map[key][2].close()
+        self.__udp_socket.close()
+
+        self.status = RunningStatus.STOPPED
+        log.warning('>>>>>>>> Proxy Client is now STOPPED !!! <<<<<<<<')
+
+    async def startup(self):
+        asyncio.create_task(self.__main_task())
+
+    async def shutdown(self):
+        log.warning(f'Stopping the Proxy Client by calling ...')
+        self.__protocol.close()
+        while self.status != RunningStatus.STOPPED:
             await asyncio.sleep(Protocol.TASK_SCHEDULE_PERIOD)
-        log.info('>>>>>>>> Proxy Client is now STOPPED !!! <<<<<<<<')
 
     async def pause(self):
         if Protocol.Result.SUCCESS == await self.__protocol.request(
                 Protocol.ClientCommand.PAUSE_PROXY, '', Protocol.CONNECTION_TIMEOUT):
-            log.success('>>>>>>>> Proxy Client is now PENDING ... <<<<<<<<')
-            return True
+            self.status = RunningStatus.PENDING
+            log.warning('>>>>>>>> Proxy Client is now PENDING ... <<<<<<<<')
         else:
             log.error('Failed to pause the Proxy Client.')
-            return False
 
     async def resume(self):
         if Protocol.Result.SUCCESS == await self.__protocol.request(
                 Protocol.ClientCommand.RESUME_PROXY, '', Protocol.CONNECTION_TIMEOUT):
-            log.success('Proxy Client is now RESUMED.')
-            return True
+            self.status = RunningStatus.RUNNING
+            log.success('>>>>>>>> Proxy Client is now RESUMED ... <<<<<<<<')
         else:
             log.error('Failed to resume the Proxy Client.')
-            return False
 
-    async def exit(self):
-        self.status = False
-        log.warning('Proxy Client is shutting down ...')
-        return True
+    def run(self, debug=False):
+        asyncio.run(self.__main_task(), debug=debug)
 
 
-def run_proxy_client(server_host, server_port, port_map, name):
-    client = ProxyClient(server_host, server_port, port_map, name)
-    asyncio.run(client.startup(), debug=False)
+def run_proxy_client(server_host, server_port, port_map, cid=None, name='AnonymousClient'):
+    """ 运行代理客户端。
+    :param server_host: 服务器主机
+    :param server_port: 服务器端口
+    :param port_map: 客户端的映射表
+    :param cid: 客户端ID
+    :param name: 客户端名称（客户端ID由服务端自动生成）
+    :return:
+    """
+    proxy_client = ProxyClient(server_host, server_port, port_map, cid, name)
+    proxy_client.run(debug=False)
 
 
-def run_proxy_client_with_reconnect(server_host, server_port, port_map, name):
-    seed = 0
-    wait = 1
+def run_proxy_client_with_reconnect(server_host, server_port, port_map, cid=None, name='AnonymousClient'):
+    """ 运行代理客户端，并在连接断开的情况下按一定的等待机制（使用相同的客户端ID）自动重连。
+    :param server_host: 服务器主机
+    :param server_port: 服务器端口
+    :param port_map: 客户端的映射表
+    :param cid: 客户端ID
+    :param name: 客户端名称（客户端ID由服务端自动生成）
+    :return:
+    """
+    seed = 1
+    wait = 2
     while True:
         if check_listening(server_host, server_port):
-            client = ProxyClient(server_host, server_port, port_map, name)
-            asyncio.run(client.startup(), debug=False)
-            seed = 0
-            wait = 1
-            continue
-        if wait < Protocol.MAX_RETRY_PERIOD:
-            waited = wait
-            wait += seed
-            seed = waited
-            if wait > Protocol.MAX_RETRY_PERIOD:
-                wait = Protocol.MAX_RETRY_PERIOD
-        log.warning(f'Trying to reconnect Server({server_host}:{server_port}) after {wait}s ...')
-        time.sleep(wait)
+            proxy_client = ProxyClient(server_host, server_port, port_map, cid, name)
+            proxy_client.run(debug=False)
+            time_halt = 10  # halting period in case of disconnected
+            log.info(f'Proxy client is disconnected, halt {time_halt}s before reconnect ...')
+            time.sleep(time_halt)
+            seed = 1
+            wait = 2
+            cid = proxy_client.client_id
+        else:
+            log.error('Proxy Service is Unreachable.')
+            if wait < Protocol.MAX_RETRY_PERIOD:
+                tmp = wait
+                wait += seed
+                seed = tmp
+                if wait > Protocol.MAX_RETRY_PERIOD:
+                    wait = Protocol.MAX_RETRY_PERIOD
+            log.info(f'Trying to reconnect Server({server_host}:{server_port}) after {wait}s ...')
+            time.sleep(wait)
 
 
 if __name__ == '__main__':
-    import sys
+    check_python_version(3, 7)
 
     log.remove()
-    log.add(sys.stderr, level="INFO")
+    log.add(sys.stderr, level="DEBUG")
     # log.add("any-proxy-server.log", level="INFO", rotation="1 month")
 
-    _port_map = {'TCP': {80: 10080, 81: 10081, 8080: 18080}, 'UDP': {80: 10080}}
-    _client_name = 'TestClient'
+    _client_id = '80000001'
+    _client_name = 'DemoClient'
+    _port_map = {'TCP': {80: 10080}, 'UDP': {}}
 
-    # run_proxy_client('0.0.0.0', 10000, _port_map, _client_name)
-    run_proxy_client_with_reconnect('0.0.0.0', 10000, _port_map, _client_name)
-    # run_proxy_client_with_reconnect('198.35.45.253', 10000, _port_map, _client_name)
+    # run_proxy_client('0.0.0.0', 10000, _port_map, _client_id, _client_name)
+    run_proxy_client_with_reconnect('localhost', 10000, _port_map, _client_id, _client_name)

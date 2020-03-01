@@ -49,11 +49,40 @@ def check_python_version(main, sub):
 def stringify_bytes_val(val):
     unit = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']
     level = 0
-
+    positive = True
+    if val < 0:
+        val = - val
+        positive = False
     while level < len(unit) - 1:
         if val < 1000:
             break
         else:
             level += 1
             val /= 1000
-    return f'{str(val)[:5]} {unit[level]}'
+    return f'{"" if positive else "-"}{str(val)[:5]} {unit[level]}'
+
+
+def stringify_speed_val(val):
+    return stringify_bytes_val(val) + '/s'
+
+
+def validate_id_string(id_str, length):
+    try:
+        if not id_str or len(id_str) != length:
+            raise ValueError
+        int(id_str, 16)  # check if `id_str` is a hex format string or not.
+        return True
+    except ValueError:
+        return False
+
+
+def validate_ip_address(ip_str):
+    try:
+        values = ip_str.split('.')
+        if len(values) != 4:
+            raise ValueError
+        for v in values:
+            int(v)
+        return True
+    except ValueError:
+        return False
