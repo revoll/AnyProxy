@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+
+
+{% block title %}端口代理服务管理中心{% endblock title %}
+
+
+{% block main_content %}
+    <div class="docs-page">
+
+        <h1 class="text-primary">端口代理服务管理中心</h1>
+        <br/>
+
+        {% if server_info["is_running"] %}
+            <h3><span>服务正在运行中...</span><small>（启动时间：{{ moment(server_info["start_time"]).format('YYYY-MM-DD HH:mm:ss') }}）</small>
+            <button class="btn btn-danger" onclick="stop_server()">关闭端口代理</button>
+            <button class="btn btn-success" onclick="restart_server()">重启端口代理</button>
+            </h3>
+        {% else %}
+            <h3><span>服务未启动。</span><small>（最后时间：{{ moment(server_info["start_time"]).format('YYYY-MM-DD HH:mm:ss') }}）</small>
+            <button class="btn btn-primary" onclick="start_server()">开启端口代理</button>
+            </h3>
+        {% endif %}
+        <hr/>
+
+        <p>ServerID: {{ server_info['server_id'] }}</p>
+        <p>ServerName: {{ server_info['server_name'] }}</p>
+        <p>ServerAddr: {{ server_info['server_host'] }}:{{ server_info['server_port'] }}</p>
+        <p>Clients: {{ server_info['clients_cnt'] }}</p>
+        <p>TCP流量: {{ server_info['tcp_statistic'] }}</p>
+        <p>UDP流量: {{ server_info['udp_statistic'] }}</p>
+        <p>总流量: {{ server_info['total_statistic'] }}</p>
+
+        <hr/>
+        <button class="btn btn-primary" onclick="reset_statistic()">重置流量统计</button>
+
+    </div>
+{% endblock main_content %}
+
+
+{% block scripts %}
+
+    {{ super() }}
+    <!-- <script type="text/javascript" src="http://echarts.baidu.com/gallery/vendors/echarts/echarts.min.js"></script> -->
+
+    <script type="text/javascript">
+
+        function start_server() {
+            notification_init(
+                '提示', '确定开启端口代理服务？',
+                '<button class="btn btn-default" data-dismiss="modal">取消</button><button class="btn btn-danger" onclick="confirm_start_server()">启动</button>');
+            notification_show();
+        }
+
+        function confirm_start_server() {
+            $.get("{{ url_for('api.start_server') }}", function(){
+                window.location.reload();
+            });
+        }
+
+        function stop_server() {
+            notification_init(
+                '提示', '确定关闭端口代理服务？',
+                '<button class="btn btn-default" data-dismiss="modal">取消</button><button class="btn btn-danger" onclick="confirm_stop_server()">关闭</button>');
+            notification_show();
+        }
+
+        function confirm_stop_server() {
+            $.get("{{ url_for('api.stop_server') }}", function(){
+                window.location.reload();
+            });
+        }
+
+        function restart_server() {
+            notification_init(
+                '提示', '确定重启端口代理服务？',
+                '<button class="btn btn-default" data-dismiss="modal">取消</button><button class="btn btn-danger" onclick="confirm_restart_server()">重启</button>');
+            notification_show();
+        }
+
+        function confirm_restart_server() {
+            $.get("{{ url_for('api.restart_server') }}", function(){
+                window.location.reload();
+            });
+        }
+
+        function reset_statistic() {
+            notification_init(
+                '提示', '确定重置所有流量统计数据？',
+                '<button class="btn btn-default" data-dismiss="modal">取消</button><button class="btn btn-danger" onclick="confirm_reset_statistic()">重置</button>');
+            notification_show();
+        }
+
+        function confirm_reset_statistic() {
+            $.get("{{ url_for('api.reset_statistic') }}", function(){
+                window.location.reload();
+            });
+        }
+    </script>
+
+{% endblock scripts %}

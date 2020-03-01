@@ -1,0 +1,10 @@
+# python3.7
+# python3-setuptools
+# python3-pip
+# virtualenv
+loguru
+flask
+flask-login
+flask-mail
+flask-moment
+flask-bootstrap

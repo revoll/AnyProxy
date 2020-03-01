@@ -1,0 +1,87 @@
+/**
+ * fix: bootstrap.css
+ */
+.input-group-addon:not(:first-child):not(:last-child),
+.input-group-btn:not(:first-child):not(:last-child) {
+	border-left: 0;
+	border-right: 0;
+}
+
+
+/**
+ * General configurations
+ */
+html {
+	font-size: 62.5%;
+	-webkit-tap-highlight-color: rgba(0, 0, 0, 0);
+	height: 100%;
+}
+body {
+	font-family: "Segoe UI", "Lucida Grande", Helvetica, Arial, "Microsoft YaHei", FreeSans, Arimo,
+	"Droid Sans", "wenquanyi micro hei", "Hiragino Sans GB", "Hiragino Sans GB W3", Arial, sans-serif;
+	font-weight: normal;
+	font-size: 1.6rem;
+	line-height: 1.6;
+	color: #333;
+	background-color: #fff;
+	/* 设置 body 使得 content 在任何的高度下都可以撑满整个屏幕 */
+	display: flex;
+	flex-direction: column;
+	height: 100%;
+}
+.docs-header {
+	/* 我们希望 header 采用固定的高度，只占用必须的空间 */
+	/* 0 flex-grow, 0 flex-shrink, auto flex-basis */
+	flex: 0 0 auto;
+}
+.docs-content {
+	margin-top: -20px;
+	margin-bottom: -60px;
+	padding-top: 60px;
+	padding-bottom: 90px;
+	/* 将 flex-grow 设置为1，该元素会占用所有的可使用空间，而其他元素该属性值为0，因此不会得到多余的空间 */
+	/* 1 flex-grow, 0 flex-shrink, auto flex-basis */
+	flex: 1 0 auto;
+}
+.docs-footer {
+	margin-top: 60px;
+	padding: 30px 0;
+	color: #99979c;
+	text-align: center;
+	background-color: #2a2730;
+	/* 和 header 一样，footer 也采用固定高度*/
+	/* 0 flex-grow, 0 flex-shrink, auto flex-basis */
+	flex: 0 0 auto;
+}
+
+.docs-footer a {
+	color: #fff;
+}
+.docs-footer .footer-links {
+	padding-left: 0;
+	margin-bottom: 20px;
+}
+.docs-footer .footer-links li {
+	display: inline-block;
+}
+.docs-footer .footer-links li + li {
+	margin-left: 15px;
+}
+@media (min-width: 768px) {
+	.docs-footer {
+		text-align: left;
+	}
+	.docs-footer p {
+		margin-bottom: 0;
+	}
+}
+
+
+.op-widget-box > * {
+	margin-left: 18px;
+	cursor: pointer;
+}
+.op-widget-box > *:first-child {
+	margin-left: 0;
+}
+
