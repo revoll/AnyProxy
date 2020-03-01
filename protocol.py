@@ -1,227 +1,144 @@
 # -*- coding: utf-8 -*-
-import socket
-import select
-from threading import Thread, current_thread, Lock
 from time import sleep
-from common import Module
-from loguru import logger as log
 
 
 class ProtocolError(Exception):
-    pass
+    """协议错误
+    """
+    def __init__(self, msg='', cmd=None, data=None):
+        err = '%s (command: %s, data: %s)' % (msg, cmd, data) if cmd is not None else msg
+        Exception.__init__(self, err)
+        self.cmd = cmd
+        self.data = data
 
 
-class Protocol(Module):
+class Protocol:
+    """内网穿透协议类
+
+    Data Transfer Protocol for each command:
+    ----------------------------------------
+        |
+        |-- PING: Request(timestamp) >>> Response(timestamp)
+        |
+        |-- IDENTIFY_CONNECTION: Request(proxy_manager_uuid) >>> Response(client_uuid)
+        |                                                           or
+        |                                                        Response(client_uuid*conn_uuid)
+        |
+        |-- QUERY_MAPPING_PORTS: Request('') >>> Response(port_mapping_pair to be mapped)
+        |-- CONFIRM_MAPPING_PORTS: Request('port_mapping_pair allowed') >>> Response(Result)
+        |
+        |-- ADD_NEW_CONNECTION:  Request('port_number') >>> Response(connection_uuid)
+        `-- CONFIRM_CONNECTION:  Request('received_connection_uuid') >>> Response(Result)
     """
-    内网穿透服务端与客户端通信协议：命令接口、工具函数等
-    """
-    MODULE_NAME = 'PROTOCOL'
     SOCKET_BUFFER_SIZE = 4096
-    MAX_CONNECTIONS = 500
+    MAX_CONNECTIONS = 100
+    SERVER_MAX_CONNECTIONS = 1000
+    DEFAULT_TIMEOUT = 15
+    MAX_RETRY_WAIT_TIME = 60
+    UUID_LENGTH = 32
+    DATA_SEPARATOR = '*'
+    __STR_RESPONSE = 'Response'
 
     class Command:
-        CHECK_MAPPING_PORTS = 'CheckMappingPorts'
         PING = 'Ping'
+        IDENTIFY_CONNECTION = 'IdentifyConnection'
+        QUERY_MAPPING_PORTS = 'QueryMappingPorts'
+        CONFIRM_MAPPING_PORTS = 'ConfirmMappingPorts'
         ADD_NEW_CONNECTION = 'AddNewConnection'
+        CONFIRM_CONNECTION = 'ConfirmConnection'
 
-    class Response:
+    class Result:
         ERROR = 'Error'
         SUCCESS = 'Success'
         INVALID = 'Invalid'
         UNKNOWN = 'Unknown'
 
     @staticmethod
-    def __default_callback(cmd, data):
-        log.info('Received "%s:%s", reply "%s" by default.', (cmd, data, Protocol.Response.UNKNOWN))
-        return Protocol.Response.UNKNOWN
-
-    @staticmethod
     def __req_str(cmd_str, val_str):
-        return '<' + cmd_str + '>' + val_str + '</' + cmd_str + '>'
+        if not cmd_str:
+            raise ProtocolError('Protocol command receives empty string.', cmd_str, val_str)
+        return '<%s>%s</%s>' % (str(cmd_str), str(val_str), str(cmd_str))
 
     @staticmethod
     def __resp_str(cmd_str, val_str):
-        return '<Response>' + cmd_str + ':' + val_str + '</Response>'
+        if not cmd_str:
+            raise ProtocolError('Protocol command receives empty string.', cmd_str, val_str)
+        return '<%s>%s:%s</%s>' % (Protocol.__STR_RESPONSE, str(cmd_str), str(val_str), Protocol.__STR_RESPONSE)
 
-    def __init__(self, server_host='127.0.0.1', server_port=10000, is_server=False):
-        super().__init__(Protocol.MODULE_NAME)
-        self.__is_server = True if is_server else False     # 服务端模式/客户端模式
-        self.__host = server_host                           # 服务器地址
-        self.__port = int(server_port)                      # 服务器端口
-        self.__t_flag = False
-        self.__t_handler = None
-        self.__sock_cmd = None
-        self.__epoll = select.epoll()
-        if self.__is_server:
-            self.__buffer = ''
-            self.__buffer_lock = Lock()
-        else:
-            self.__fn_callback = Protocol.__default_callback
-        self.set_status(Module.Status.PREPARE)
+    @staticmethod
+    def __parse_req_str(req):
+        p1 = req.find('>', 1, -2)
+        p2 = req.find('<', 2, -1)
+        if req[0] == '<' and 0 < p1 < p2 and req[-1] == '>' and req[1:p1] == req[p2+2:-1]:
+            return req[1:p1], req[p1+1:p2]
+        raise ProtocolError('Parsing invalid request: %s' % req)
 
-    def __identify(self, is_server):
-        if self.__is_server != is_server:
-            raise ProtocolError('Function not supported in %s mode.' % 'CLIENT' if self.__is_server else 'SERVER')
+    @staticmethod
+    def __parse_resp_str(resp):
+        prefix = '<%s>' % Protocol.__STR_RESPONSE
+        suffix = '</%s>' % Protocol.__STR_RESPONSE
+        p = resp.find(':', len(prefix), -len(suffix))
+        if p > 0 and len(resp) >= len(Protocol.__resp_str('z', '')) and \
+                resp[:len(prefix)] == prefix and resp[-len(suffix):] == suffix:
+            return resp[len(prefix):p], resp[p+1:-len(suffix)]
+        raise ProtocolError('Parsing invalid response: %s' % resp)
 
-    def register_process_callback(self, func):
-        self.__identify(is_server=False)
-        self.__fn_callback = func
-
-    def execute(self, cmd, data):
-        self.__identify(is_server=True)
-        _req = self.__req_str(cmd, str(data))
-        self.__sock_cmd.send(_req.encode())
-        while not self.__buffer:
-            sleep(0.1)
-        with self.__buffer_lock:
-            _resp = self.__buffer
-            self.__buffer = ''
-        if len(_resp) >= len(self.__resp_str(cmd, '')) and _resp[10:10+len(cmd)] == cmd \
-                and _resp[:10] == '<Response>' and _resp[-11:] == '</Response>':
-            return _resp[10:-11].split(':', 1)[1]
-        else:
-            raise ProtocolError('Invalid response format: sent %s while received %s.' % (_req, _resp))
-
-    def __thread_server(self):
+    @staticmethod
+    def request_client(conn, cmd, data='', timeout=-1):
+        """【服务端】 主动询问客户端信息。（注意：socket必须为非阻塞模式！）
+        :param conn: 非阻塞模式的TCP套接字
+        :param cmd: 需要执行的询问指令
+        :param data: 指令附带的数据
+        :param timeout: 超时时间
+        :return: 客户端响应的结果信息
         """
-        服务端服务线程函数：除监视连接状态外，不执行其它任务
+        req_str = Protocol.__req_str(cmd, data)
+        conn.sendall(req_str.encode())
+        time_wait = 0.0
+        while timeout == -1 or time_wait < timeout:
+            try:
+                resp_str = conn.recv(Protocol.SOCKET_BUFFER_SIZE).decode()
+                resp_cmd, resp_data = Protocol.__parse_resp_str(resp_str)
+                if resp_cmd == cmd:
+                    return resp_cmd, resp_data
+                else:
+                    raise ProtocolError('Expected <%s> while received <%s>.' % (cmd, resp_cmd))
+            except BlockingIOError:
+                pass
+            sleep(0.25)
+            time_wait += 0.25
+        raise ProtocolError('Waiting client response timeout after %ds.' % timeout, cmd, data)
+
+    @staticmethod
+    def receive_request(conn, expect_cmd=None, timeout=-1):
+        """【客户端】 接收来自服务端的请求。（这是处理请求的第一步。注意：socket必须为非阻塞模式！）
+        :param conn: 非阻塞模式的TCP套接字
+        :param expect_cmd: 期望得到的指令（如果不匹配将触发异常）
+        :param timeout: 超时时间
         :return:
         """
-        self.__t_flag = True
-        log.info('%s started.' % current_thread().name)
-        try:
-            while self.__t_flag:
-                events = self.__epoll.poll(1)
-                if not events:
-                    continue
-                for fd, event in events:
-                    if event & ~select.EPOLLIN:
-                        raise Exception('Connection closed unexpectedly.')
-                    else:
-                        _data = self.__sock_cmd.recv(Protocol.SOCKET_BUFFER_SIZE)
-                        if _data:
-                            with self.__buffer_lock:
-                                self.__buffer += _data.decode()
-        except Exception as e:
-            log.critical(e)
-        finally:
-            self.__epoll.unregister(self.__sock_cmd.fileno())
-            self.__sock_cmd.close()
-        log.warning('%s exited.' % current_thread().name)
-        self.__t_flag = False
-        self.set_status(Module.Status.STOPPED)
+        time_wait = 0.0
+        while timeout == -1 or time_wait < timeout:
+            try:
+                req_str = conn.recv(Protocol.SOCKET_BUFFER_SIZE).decode()
+                req_cmd, req_data = Protocol.__parse_req_str(req_str)
+                if expect_cmd and req_cmd != expect_cmd:
+                    Protocol.response_server(conn, req_cmd, Protocol.Result.INVALID)
+                    raise ProtocolError('Expected <%s> while received <%s>.' % (expect_cmd, req_cmd))
+                else:
+                    return req_cmd, req_data
+            except BlockingIOError:
+                pass
+            sleep(0.25)
+            time_wait += 0.25
+        raise ProtocolError('Waiting server request timeout after %ds.' % timeout)
 
-    def __thread_client(self):
-        """
-        客户端服务线程函数：处理服务端的请求并返回结果
+    @staticmethod
+    def response_server(conn, cmd, data=''):
+        """【客户端】 对服务端的请求做出响应。（这是处理请求的第二步。注意：socket必须为非阻塞模式！）
+        :param conn: 非阻塞模式的TCP套接字
+        :param cmd: 需要响应的询问指令
+        :param data: 指令附带的数据
         :return:
         """
-        def process_request(req):
-            p1 = req.find('>', 0, -1)
-            p2 = req.find('<', 1)
-            if 0 < p1 < p2 and req[0] == '<' and req[-1] == '>' and req[1:p1] == req[p2+2:-1]:
-                _cmd = req[1:p1]
-                _data = req[p1+1:p2]
-            else:
-                log.error('Invalid command form server: %s', req)
-                return ''
-            return self.__resp_str(_cmd, self.__fn_callback(_cmd, _data))
-
-        self.__t_flag = True
-        log.info('%s started.' % current_thread().name)
-        try:
-            while self.__t_flag:
-                events = self.__epoll.poll(1)
-                if not events:
-                    continue
-                for fd, event in events:
-                    if event & ~select.EPOLLIN:
-                        raise Exception('Connection closed unexpectedly.')
-                    else:
-                        _req = self.__sock_cmd.recv(Protocol.SOCKET_BUFFER_SIZE)
-                        if _req:
-                            _resp = process_request(_req.decode())
-                            if _resp:
-                                self.__sock_cmd.send(_resp.encode())
-        except Exception as e:
-            log.critical(e)
-        finally:
-            self.__epoll.unregister(self.__sock_cmd.fileno())
-            self.__sock_cmd.close()
-        log.warning('%s exited.' % current_thread().name)
-        self.__t_flag = False
-        self.set_status(Module.Status.STOPPED)
-
-    def start(self):
-        super().start()
-        if self.__is_server:
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                sock.bind((self.__host, self.__port))
-                sock.listen(1)
-                log.info('Listening client connection on port(%d)...' % self.__port)
-                self.__sock_cmd, address = sock.accept()
-                sock.close()
-                self.__sock_cmd.setblocking(False)
-                self.__epoll.register(self.__sock_cmd.fileno(), select.EPOLLIN | select.EPOLLRDHUP)
-                log.info('Connected from %s:%d' % (address[0], address[1]))
-            except socket.error as e:
-                log.error('%s. Failed to bind on port(%d).' % (e, self.__port))
-                exit()
-            self.__t_handler = Thread(None, self.__thread_server, 'Thread-ServerProtocol', (), daemon=False)
-            self.__t_handler.start()
-        else:
-            try:
-                self.__sock_cmd = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.__sock_cmd.connect((self.__host, self.__port))
-                self.__sock_cmd.setblocking(False)
-                self.__epoll.register(self.__sock_cmd.fileno(), select.EPOLLIN | select.EPOLLRDHUP)
-                log.info('Connected to %s:%d' % (self.__host, self.__port))
-            except socket.error as e:
-                log.error('%s. Failed to connect to the server.' % e)
-                exit()
-            self.__t_handler = Thread(None, self.__thread_client, 'Thread-ClientProtocol', (), daemon=False)
-            self.__t_handler.start()
-        self.set_status(Module.Status.RUNNING)
-
-    def stop(self):
-        self.set_status(Module.Status.STOPPED)
-        if self.__t_flag:
-            self.__t_flag = False
-            self.__t_handler.join()
-        super().stop()
-
-
-if __name__ == '__main__':
-    def __protocol_callback(cmd, data):
-        if cmd == Protocol.Command.CHECK_MAPPING_PORTS:
-            port_mapping = eval(data)
-            for port in list(port_mapping.keys()):
-                try:
-                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    s.connect(('', port))
-                except ConnectionRefusedError:
-                    del port_mapping[port]
-            return str(port_mapping)
-        else:
-            log.error('Invalid command.')
-            return Protocol.Response.INVALID
-    server_protocol = Protocol(is_server=True)
-    client_protocol = Protocol(is_server=False)
-    client_protocol.register_process_callback(__protocol_callback)
-    server_handler = Thread(None, server_protocol.start, 'Server-Start()', ())
-    client_handler = Thread(None, client_protocol.start, 'Client-Start()', ())
-    server_handler.start()
-    client_handler.start()
-    server_handler.join()
-    client_handler.join()
-    mapping = {80: 10080, 81: 10081, 82: 10082}
-    response = server_protocol.execute(Protocol.Command.CHECK_MAPPING_PORTS, str(mapping))
-    try:
-        while True:
-            sleep(1)
-    except KeyboardInterrupt:
-        pass
-    server_protocol.stop()
-    client_protocol.stop()
+        conn.sendall(Protocol.__resp_str(cmd, data).encode())
